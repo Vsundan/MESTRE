@@ -97,18 +97,21 @@ def get_opss_notes_from_db(opss_numbers: list) -> dict:
 
 
 CATEGORIES = {
-    "Earthwork": ["excavat", "grading", "earth", "borrow", "backfill", "stockpile"],
+    "Earthwork": ["excavat", "grading", "earth", "borrow", "backfill", "stockpile",
+                  "capping", "clay cap", "import clay", "geogrid"],
     "Granular": ["granular", "base", "subbase", "aggregate"],
     "Asphalt": ["asphalt", "hot mix", "hma", "paving", "tack coat", "milling"],
     "Concrete": ["concrete", "formwork", "rebar", "reinforc", "curing"],
-    "Pipe/Sewer": ["sewer", "pipe", "culvert", "manhole", "drainage", "hdpe", "pvc"],
+    "Pipe/Sewer": ["sewer", "pipe", "culvert", "manhole", "drainage", "hdpe", "pvc",
+                   "cctv", "leachate"],
     "Watermain": ["watermain", "water main", "hydrant", "valve"],
     "Electrical": ["electrical", "conduit", "wiring", "lighting", "signal"],
-    "Erosion Control": ["erosion", "silt", "sediment", "geotextile"],
+    "Erosion Control": ["erosion", "silt", "sediment", "geotextile",
+                        "straw bale", "check dam", "flow check"],
     "Landscaping": ["topsoil", "seed", "sod", "restoration", "landscap"],
     "Traffic": ["traffic", "sign", "barricade", "delineator"],
     "Demolition": ["remov", "demolit", "strip"],
-    "Fencing": ["fence", "fencing", "gate"],
+    "Fencing": ["fence", "fencing", "gate", "litter fence"],
     "Equipment/Labour": ["hourly rate", "haulage", "equipment", "labour", "operator"],
     "General": [],
 }
@@ -161,8 +164,18 @@ SECTION_FONT  = Font(bold=True, color="FFFFFF", size=11)
 # Helper functions — existing
 # ─────────────────────────────────────────────
 
-def categorize_item(description: str) -> str:
+def categorize_item(description: str, unit: str = "") -> str:
     desc_lower = str(description).lower()
+    unit_upper = str(unit).upper()
+
+    # Hourly rate items → Equipment/Labour regardless of description
+    if unit_upper == "HOURS":
+        return "Equipment/Labour"
+
+    # "inspection" only qualifies as Pipe/Sewer when near pipe/leachate context
+    if "inspection" in desc_lower and any(kw in desc_lower for kw in ("pipe", "leachate", "sewer", "culvert")):
+        return "Pipe/Sewer"
+
     for cat, keywords in CATEGORIES.items():
         if cat == "General":
             continue
@@ -194,6 +207,7 @@ def validate_extraction(items: list) -> tuple[list, list]:
     warnings = []
     cleaned = []
     seen_exact = set()
+    seen_item_nos: set = set()  # item_nos already in cleaned; used for spec-text dedup
     # fuzzy_seen: (item_no, desc[:30]) → index in cleaned; used for dedup keeping the qty version
     fuzzy_seen: dict = {}
 
@@ -240,8 +254,17 @@ def validate_extraction(items: list) -> tuple[list, list]:
             continue
         seen_exact.add(exact_key)
 
-        # Fuzzy dedup: same item_no + first 30 chars of description
+        # Spec-text dedup: same item_no + no quantity + unit is "unit price" or "lump sum"
+        # These are Item Special Provisions re-extractions, not real schedule rows
         item_no = str(item.get("item_no") or "")
+        unit_lower = str(item.get("unit") or "").lower().strip()
+        if (item_no and item_no in seen_item_nos
+                and item.get("quantity") is None
+                and unit_lower in ("unit price", "lump sum")):
+            warnings.append(f"Item {label} ({desc[:40]}): spec-text duplicate (no qty, unit='{unit_lower}') — skipped")
+            continue
+
+        # Fuzzy dedup: same item_no + first 30 chars of description
         fuzzy_key = (item_no, desc[:30].lower())
         if fuzzy_key in fuzzy_seen and item_no:  # only fuzzy-dedup when item_no is present
             existing_idx = fuzzy_seen[fuzzy_key]
@@ -256,6 +279,8 @@ def validate_extraction(items: list) -> tuple[list, list]:
                 warnings.append(f"Item {label} ({desc[:30]}): fuzzy duplicate — skipped")
             continue
 
+        if item_no:
+            seen_item_nos.add(item_no)
         fuzzy_seen[fuzzy_key] = len(cleaned)
         cleaned.append(item)
     return cleaned, warnings
@@ -1180,7 +1205,7 @@ if extract_btn and uploaded:
     # Step 5: Validate + split by quality
     with st.spinner("Validating extraction..."):
         for item in items_raw:
-            item["category"] = categorize_item(item.get("description", ""))
+            item["category"] = categorize_item(item.get("description", ""), item.get("unit", ""))
         all_validated, val_warnings = validate_extraction(items_raw)
         items, possible_items = split_items_by_quality(all_validated)
         if possible_items:
@@ -1632,12 +1657,14 @@ if st.session_state.get("extraction_done"):
                             "role": "user",
                             "content": (
                                 "You are MESTRE, a Canadian construction bidding intelligence assistant. "
-                                "You help contractors understand tender documents and develop bid strategy.\n\n"
-                                f"Context — this tender has been extracted:\n{items_context}\n\n"
+                                "You have read and analyzed this tender document in full. "
+                                "Help the contractor understand the tender and develop their bid strategy.\n\n"
+                                f"Extracted schedule items:\n{items_context}\n\n"
                                 f"Tender summary: {st.session_state.get('tender_summary', 'Not available')}\n\n"
                                 f"The contractor is asking: {prompt}\n\n"
                                 "Answer specifically based on this tender. Be practical, direct, and reference "
-                                "specific item numbers when relevant. If you don't know something, say so."
+                                "specific item numbers when relevant. If information is not in the extracted data, "
+                                "say what you do know and suggest where in the document to look."
                             ),
                         }
                     ],
