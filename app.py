@@ -621,7 +621,14 @@ def analyze_cost_risks(items: list) -> list:
                 "advice": "Owner's contingency, not yours. Do not include in your cost estimate.",
             })
 
-    return risks
+    seen = set()
+    unique_risks = []
+    for risk in risks:
+        key = f"{risk['item']}_{risk['risk']}"
+        if key not in seen:
+            seen.add(key)
+            unique_risks.append(risk)
+    return unique_risks
 
 
 def extract_tender_header(full_text: str) -> dict:
@@ -1119,7 +1126,7 @@ trade_filter = st.selectbox(
 )
 
 full_scan = st.checkbox(
-    "Deep scan (slower, $0.60+ — use only if items seem missing)",
+    "Extended Analysis — reads full document (additional processing time and cost)",
     value=False,
 )
 
@@ -1621,11 +1628,11 @@ elif not extract_btn:
 # Q&A Chat Interface
 # ─────────────────────────────────────────────
 def count_questions(text: str) -> int:
-    """Count actual questions in a message, not just message count."""
+    """Count questions by question marks. If no question marks, count as 1."""
     q_marks = text.count("?")
-    splitters = re.split(r"\band\b|\balso\b|\bplus\b|\badditionally\b|&|\?", text, flags=re.IGNORECASE)
-    meaningful = [s.strip() for s in splitters if len(s.strip()) > 15]
-    return max(q_marks, len(meaningful), 1)
+    if q_marks == 0:
+        return 1
+    return q_marks
 
 
 if st.session_state.get("extraction_done"):
