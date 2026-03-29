@@ -8,8 +8,11 @@ __pycache__/
 *.pyo
 
 
-# Local data reset on redeploy anyway
+# Local data (reset on redeploy anyway)
+chromadb-store/
 market-data/
+opss-library/
+sample-tenders/
 
 # Large test outputs
 *.xlsx
