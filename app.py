@@ -1119,7 +1119,7 @@ trade_filter = st.selectbox(
 )
 
 full_scan = st.checkbox(
-    "☐ Full document scan (slower — catches more items, good for high-value bids)",
+    "Deep scan (slower, $0.60+ — use only if items seem missing)",
     value=False,
 )
 
@@ -1175,13 +1175,13 @@ if extract_btn and uploaded:
         if not schedule_page_indices:
             st.warning("No schedule pages detected — scanning full document.")
         if full_scan:
-            st.info(f"Full document scan: all {num_pages} pages → Claude.")
+            st.info(f"Deep scan: processing all {num_pages} pages.")
         else:
             span = (
                 f"pages {schedule_page_indices[0]+1}–{schedule_page_indices[-1]+1}"
                 if schedule_page_indices else "full document"
             )
-            st.info(f"{num_schedule_pages} schedule pages ({span}) — sending to Claude.")
+            st.info(f"{num_schedule_pages} schedule pages ({span}) detected.")
 
     # Step 3: Extract items with Claude
     client = anthropic.Anthropic(api_key=_ANTHROPIC_API_KEY)
@@ -1532,16 +1532,16 @@ if items:
             s1, s2, s3, s4, s5 = st.columns(5)
             s1.metric("Extraction Time",   f"{stats['elapsed']:.1f}s")
             s2.metric("Pages Processed",   stats["pages"])
-            s3.metric("Schedule Pages",    stats["schedule_pages"])
-            s4.metric("Chars to Claude",   f"{stats['chars_sent']:,}")
-            s5.metric("API Cost Est.",     f"${stats['api_cost']:.4f}")
+            s3.metric("Pages Analyzed",    stats["schedule_pages"])
+            s4.metric("Input Volume",      f"{stats['chars_sent']:,}")
+            s5.metric("Engine Units",      f"{stats['api_cost'] * 10:.1f} EU")
             if stats.get("second_pass"):
                 st.caption(f"Second pass recovered {stats['second_pass']} additional item(s).")
             if stats.get("full_scan"):
-                st.caption("Full document scan mode was used.")
+                st.caption("Deep scan mode was used.")
             st.divider()
             v1, v2, v3 = st.columns(3)
-            v1.metric("Extraction cost",    f"${stats['api_cost']:.4f}")
+            v1.metric("Engine Units",       f"{stats['api_cost'] * 10:.1f} EU")
             v2.info("💼 **Contractor value**  \nReplaces ~4–8 hours of manual takeoff work")
             v3.success("💰 **MESTRE price**  \n$29 per scan")
 
@@ -1670,7 +1670,7 @@ if st.session_state.get("extraction_done"):
         )
 
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
+            with st.spinner("MESTRE™ is analyzing your tender..."):
                 _client = anthropic.Anthropic(api_key=_ANTHROPIC_API_KEY)
                 response = _client.messages.create(
                     model=CLAUDE_MODEL,
@@ -1684,10 +1684,11 @@ if st.session_state.get("extraction_done"):
                                 "Help the contractor understand the tender and develop their bid strategy.\n\n"
                                 f"Extracted schedule items:\n{items_context}\n\n"
                                 f"Tender summary: {st.session_state.get('tender_summary', 'Not available')}\n\n"
+                                f"The system detected {num_questions} question(s) in this message. "
                                 f"The contractor is asking: {prompt}\n\n"
-                                "If the user asks multiple questions in one message, answer all of them but "
-                                "note how many distinct questions you identified. Format: start your response "
-                                "with 'I see X questions in your message:' then answer each one with a clear heading. "
+                                f"If {num_questions} > 1, start your response with "
+                                f"'I see {num_questions} questions in your message:' then answer each one "
+                                "with a clear heading. "
                                 "Answer specifically based on this tender. Be practical, direct, and reference "
                                 "specific item numbers when relevant. If information is not in the extracted data, "
                                 "say what you do know and suggest where in the document to look."
