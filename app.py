@@ -1620,6 +1620,14 @@ elif not extract_btn:
 # ─────────────────────────────────────────────
 # Q&A Chat Interface
 # ─────────────────────────────────────────────
+def count_questions(text: str) -> int:
+    """Count actual questions in a message, not just message count."""
+    q_marks = text.count("?")
+    splitters = re.split(r"\band\b|\balso\b|\bplus\b|\badditionally\b|&|\?", text, flags=re.IGNORECASE)
+    meaningful = [s.strip() for s in splitters if len(s.strip()) > 15]
+    return max(q_marks, len(meaningful), 1)
+
+
 if st.session_state.get("extraction_done"):
     st.markdown("---")
     st.subheader("Ask about this tender")
@@ -1630,13 +1638,28 @@ if st.session_state.get("extraction_done"):
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    if prompt := st.chat_input("Ask about this tender..."):
-        question_count = st.session_state.get("question_count", 0) + 1
-        st.session_state.question_count = question_count
+    if "question_count" not in st.session_state:
+        st.session_state.question_count = 0
 
-        if question_count > 5:
+    used = st.session_state.question_count
+    remaining = max(0, 5 - used)
+    st.caption(f"Questions used: {used}/5 ({remaining} remaining)")
+
+    if prompt := st.chat_input("Ask about this tender..."):
+        num_questions = count_questions(prompt)
+        remaining = max(0, 5 - st.session_state.question_count)
+
+        if remaining <= 0:
             st.warning("You've used your 5 included questions. Additional questions: $2 each.")
             st.stop()
+
+        if num_questions > remaining:
+            st.warning(
+                f"Your message contains {num_questions} questions but you only have "
+                f"{remaining} remaining. They'll all be counted — extras at $2 each."
+            )
+
+        st.session_state.question_count += num_questions
 
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -1662,6 +1685,9 @@ if st.session_state.get("extraction_done"):
                                 f"Extracted schedule items:\n{items_context}\n\n"
                                 f"Tender summary: {st.session_state.get('tender_summary', 'Not available')}\n\n"
                                 f"The contractor is asking: {prompt}\n\n"
+                                "If the user asks multiple questions in one message, answer all of them but "
+                                "note how many distinct questions you identified. Format: start your response "
+                                "with 'I see X questions in your message:' then answer each one with a clear heading. "
                                 "Answer specifically based on this tender. Be practical, direct, and reference "
                                 "specific item numbers when relevant. If information is not in the extracted data, "
                                 "say what you do know and suggest where in the document to look."
@@ -1672,3 +1698,7 @@ if st.session_state.get("extraction_done"):
                 answer = response.content[0].text
                 st.write(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
+
+        used_now = st.session_state.question_count
+        remaining_now = max(0, 5 - used_now)
+        st.caption(f"Questions used: {used_now}/5 ({remaining_now} remaining)")
