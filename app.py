@@ -1781,6 +1781,7 @@ def build_xlsx(
     opss_notes_map: dict | None = None,
     possible_items: list | None = None,
     summary_rows: list | None = None,
+    debug_info: dict | None = None,
 ) -> BytesIO:
     """6-sheet workbook: Takeoff, Summary, OPSS Notes, Strategy & Risks, Bid Checklist, Timeline."""
     wb = openpyxl.Workbook()
@@ -2077,6 +2078,24 @@ def build_xlsx(
     ws6.column_dimensions["D"].width = 12
     ws6.column_dimensions["E"].width = 55
 
+    # ── Debug sheet ─────────────────────────────────────────────────────────────
+    if debug_info:
+        wsd = wb.create_sheet("Debug")
+        wsd.column_dimensions["A"].width = 35
+        wsd.column_dimensions["B"].width = 80
+        debug_rows = [
+            ("Code Version",                  debug_info.get("code_version", "?")),
+            ("Project Type Detected",          debug_info.get("project_type", "?")),
+            ("OPSS Codes Found (regex)",       ", ".join(debug_info.get("opss_regex", []))),
+            ("OPSS Codes Found (API)",         ", ".join(debug_info.get("opss_api", []))),
+            ("Summary Rows Found",             str(len(debug_info.get("summary_rows", [])))),
+        ]
+        for item in debug_info.get("schedule_items", []):
+            debug_rows.append((str(item.get("description", ""))[:100], item.get("category", "?")))
+        for r, (label, value) in enumerate(debug_rows, 1):
+            wsd.cell(r, 1, label)
+            wsd.cell(r, 2, value)
+
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -2364,6 +2383,17 @@ if extract_btn and uploaded:
             opss_notes_map=opss_note_map,
             possible_items=possible_items,
             summary_rows=summary_rows,
+            debug_info={
+                "code_version":  "04d769f",
+                "project_type":  project_type,
+                "opss_regex":    opss_regex_codes,
+                "opss_api":      opss_full_scan_codes,
+                "summary_rows":  summary_rows,
+                "schedule_items": [
+                    {"description": it.get("description", ""), "category": it.get("category", "?")}
+                    for it in items
+                ],
+            },
         )
 
     t_elapsed      = time.time() - t_start
