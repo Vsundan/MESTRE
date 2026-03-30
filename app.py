@@ -2275,6 +2275,7 @@ if extract_btn and uploaded:
         filtered_items, numbered_rate_warnings = ensure_numbered_rate_items(schedule_text, filtered_items)
         for item in filtered_items:
             item["category"] = categorize_item(item.get("description", ""), item.get("unit", ""))
+            print(f"[DEBUG CAT] item_no={item.get('item_no','?')!r:8} cat={item.get('category','?'):20} desc={str(item.get('description',''))[:80]!r}", flush=True)
         all_validated, val_warnings = validate_extraction(filtered_items)
         val_warnings = filter_warnings + lump_sum_warnings + labour_warnings + numbered_rate_warnings + val_warnings
         items, possible_items = split_items_by_quality(all_validated)
@@ -2285,16 +2286,22 @@ if extract_btn and uploaded:
             )
 
     # FIX 4: Extract summary/total rows (Contingency, HST, Total Tender Price)
+    print(f"[DEBUG SUMMARY] schedule_text length={len(schedule_text)} chars", flush=True)
     summary_rows = extract_summary_rows(schedule_text)
+    print(f"[DEBUG SUMMARY] matched {len(summary_rows)} summary rows: {[r.get('description','?') for r in summary_rows]}", flush=True)
 
     # Step 6: OPSS refs — Pass 1 (schedule items) + Pass 2 regex + Claude full scan (FIX 2+3)
     opss_refs_from_items = extract_opss_refs(items)
     # FIX 2 Pass 2: zero-cost regex scan of full document
+    print(f"[DEBUG OPSS] full_text length={len(full_text)} chars", flush=True)
     opss_regex_codes = extract_opss_from_full_text(full_text)
+    print(f"[DEBUG OPSS] regex pass found: {opss_regex_codes}", flush=True)
     opss_full_scan_results = call_claude_for_opss_full_scan(client, full_text)
     chars_used += min(len(full_text), 80000)
     # Merge all three passes: schedule items + regex + Claude full scan
     opss_full_scan_codes = [str(e.get("code", "")).strip() for e in opss_full_scan_results if e.get("code")]
+    print(f"[DEBUG OPSS] claude pass found: {opss_full_scan_codes}", flush=True)
+    print(f"[DEBUG OPSS] pass1 (from items): {opss_refs_from_items}", flush=True)
     all_opss_codes = sorted(
         set(opss_refs_from_items + opss_regex_codes + opss_full_scan_codes),
         key=lambda x: int(x) if x.isdigit() else 9999,
@@ -2318,7 +2325,9 @@ if extract_btn and uploaded:
     # Step 7: Project type detection + project-type-aware missing scope warnings (FIX 3)
     # Detect project type early so warnings are tailored to scope (not generic for all tenders)
     project_type = detect_project_type(full_text, items)
+    print(f"[DEBUG PROJTYPE] detected project_type={project_type!r}", flush=True)
     missing_warnings = generate_missing_warnings(project_type, items)
+    print(f"[DEBUG PROJTYPE] generate_missing_warnings returned {len(missing_warnings)} warnings: {missing_warnings}", flush=True)
 
     # Step 8: Cross-verification
     with st.spinner("Running cross-verification..."):
@@ -2342,6 +2351,7 @@ if extract_btn and uploaded:
     # FIX 3+4+5: Project type already detected in Step 7; use it for project-type-aware risk engine
     # project_type is set above (Step 7); timeline_items now available for risk scoring
     project_type_risks = generate_project_type_risks(project_type, full_text, items, timeline_items)
+    print(f"[DEBUG PROJTYPE] generate_project_type_risks returned {len(project_type_risks)} risks: {[r.get('risk','?') for r in project_type_risks]}", flush=True)
     # Prepend project-type risks to cost_risks
     cost_risks = build_project_type_risk_section(project_type, project_type_risks) + cost_risks
 
