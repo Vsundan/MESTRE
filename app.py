@@ -3301,7 +3301,7 @@ if extract_btn and uploaded:
             summary_rows=summary_rows,
             project_type=project_type,
             debug_info={
-                "code_version":  "59b219d",
+                "code_version":  "512ee00",
                 "project_type":  project_type,
                 "opss_regex":    opss_regex_codes,
                 "opss_api":      opss_full_scan_codes,
