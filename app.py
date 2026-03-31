@@ -361,6 +361,7 @@ def _is_valid_schedule_item_no(item_no: str) -> bool:
     return bool(re.fullmatch(
         r"(?:"
         r"\d+(?:\.\d+)?[A-Za-z]?|"
+        r"(?:FA|EQ)-?\d+|"
         r"[PE]-?\d+|"
         r"(?:LABOUR|LABOR)-\d+|"
         r"L-?\d+|"
@@ -568,13 +569,11 @@ def extract_summary_rows(schedule_text: str) -> list:
     """
     summary_rows = []
     lines = schedule_text.splitlines()
-    # Only scan the last 120 lines — summary rows are always at the bottom
-    tail_lines = lines[-120:] if len(lines) > 120 else lines
 
     # Patterns to detect summary rows (case-insensitive)
     _summary_patterns = [
         # Subtotal / Tender Price (excluding HST)
-        (re.compile(r"tender price\s*\(excluding hst\)", re.IGNORECASE), "SUBTOTAL"),
+        (re.compile(r"tender\s+price\s*\(\s*excluding\s+hst\s*\)", re.IGNORECASE), "SUBTOTAL"),
         (re.compile(r"sub[-\s]?total", re.IGNORECASE), "SUBTOTAL"),
         (re.compile(r"subtotal", re.IGNORECASE), "SUBTOTAL"),
         # Contingency with %
@@ -582,21 +581,24 @@ def extract_summary_rows(schedule_text: str) -> list:
         (re.compile(r"contingency\s+\d+\s*%", re.IGNORECASE), "CONTINGENCY"),
         # HST / Harmonized Sales Tax
         (re.compile(r"hst\s*\(\s*\d+\s*%\s*\)", re.IGNORECASE), "TAX"),
-        (re.compile(r"harmonized sales tax\s*\(\s*\d+\s*%\s*\)", re.IGNORECASE), "TAX"),
+        (re.compile(r"harmonized\s+sales\s+tax\s*\(\s*\d+\s*%\s*\)", re.IGNORECASE), "TAX"),
         # Total Tender Price / Grand Total
-        (re.compile(r"total tender price\s*\(including hst\)", re.IGNORECASE), "TOTAL"),
-        (re.compile(r"total tender price", re.IGNORECASE), "TOTAL"),
-        (re.compile(r"grand total", re.IGNORECASE), "TOTAL"),
+        (re.compile(r"total\s+tender\s+price\s*\(\s*including\s+hst\s*\)", re.IGNORECASE), "TOTAL"),
+        (re.compile(r"total\s+tender\s+price", re.IGNORECASE), "TOTAL"),
+        (re.compile(r"grand\s+total", re.IGNORECASE), "TOTAL"),
     ]
 
     seen_row_keys = set()
-    for line in tail_lines:
+    for line in lines:
         line_stripped = line.strip()
         if not line_stripped:
             continue
+        # Summary rows are short bid-form labels, not narrative sentences.
+        if len(line_stripped) > 80:
+            continue
         for pattern, row_type in _summary_patterns:
-            if pattern.search(line_stripped):
-                row_key = (row_type, line_stripped[:60])
+            if pattern.fullmatch(line_stripped):
+                row_key = (row_type, re.sub(r"\s+", " ", line_stripped).lower()[:60])
                 if row_key in seen_row_keys:
                     break
                 seen_row_keys.add(row_key)
@@ -846,6 +848,143 @@ def ensure_numbered_rate_items(schedule_text: str, items: list) -> tuple[list, l
             items.append(parsed)
 
     return items, warnings
+
+
+def _normalize_force_account_description(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    raw = raw.replace("(complete with operator)", "")
+    raw = re.sub(r"[^a-z0-9]+", " ", raw)
+    return " ".join(raw.split())
+
+
+def ensure_force_account_rate_items(schedule_text: str, items: list, full_text: str = "") -> tuple[list, list]:
+    """
+    Backfill "Schedule of Force Account Rates" rows when the model skips blank rate tables.
+    Prefer schedule_text to avoid table-of-contents/narrative false positives, and fall back
+    to full_text only if the schedule slice did not include the force account page.
+    """
+    warnings = []
+    search_sources = [schedule_text]
+    if full_text and full_text != schedule_text:
+        search_sources.append(full_text)
+
+    personnel_entries: list[str] = []
+    equipment_entries: list[str] = []
+    equipment_suffix = ""
+    skip_exact = {
+        "list by occupation",
+        "hourly rate",
+        "overtime hourly rate",
+        "description",
+        "model and size",
+        "other (list)",
+    }
+
+    for source_text in search_sources:
+        lines = [line.strip() for line in source_text.splitlines()]
+        for idx, line in enumerate(lines):
+            if "schedule of force account rates" not in line.lower():
+                continue
+
+            window = lines[idx:min(len(lines), idx + 120)]
+            if not any(entry.lower() == "personnel" for entry in window):
+                continue
+            if not any(entry.lower().startswith("equipment") for entry in window):
+                continue
+
+            current_section = ""
+            local_personnel: list[str] = []
+            local_equipment: list[str] = []
+            local_suffix = ""
+
+            for candidate in window:
+                lowered = candidate.lower()
+                if not candidate:
+                    continue
+                if lowered == "personnel":
+                    current_section = "personnel"
+                    continue
+                if re.match(r"^equipment\s*(?::|\()", lowered) or lowered == "equipment":
+                    current_section = "equipment"
+                    if "complete with operator" in lowered:
+                        local_suffix = " (COMPLETE WITH OPERATOR)"
+                    continue
+                if candidate.isdigit():
+                    continue
+                if lowered in skip_exact:
+                    continue
+                if current_section == "personnel":
+                    if re.fullmatch(r"[A-Z][A-Z\s/&()\-]{8,}", candidate):
+                        break
+                    local_personnel.append(candidate)
+                    continue
+                if current_section == "equipment":
+                    if lowered == "other (list)":
+                        current_section = ""
+                        break
+                    if re.fullmatch(r"[A-Z][A-Z\s/&()\-]{8,}", candidate):
+                        break
+                    local_equipment.append(candidate)
+
+            local_personnel = [entry for entry in local_personnel if entry]
+            local_equipment = [entry for entry in local_equipment if entry]
+            if local_personnel or local_equipment:
+                personnel_entries = local_personnel
+                equipment_entries = local_equipment
+                equipment_suffix = local_suffix
+                break
+
+        if personnel_entries or equipment_entries:
+            break
+
+    if not personnel_entries and not equipment_entries:
+        return items, warnings
+
+    def _make_force_account_row(prefix: str, number: int, description: str, spec_ref: str) -> dict:
+        normalized_desc = description
+        if prefix == "EQ" and equipment_suffix and "complete with operator" not in description.lower():
+            normalized_desc = f"{description}{equipment_suffix}"
+        return {
+            "item_no": f"{prefix}-{number}",
+            "spec_ref": spec_ref,
+            "description": normalized_desc,
+            "quantity": None,
+            "unit": "HOURS",
+            "is_provisional": False,
+            "confidence": 1.0,
+            "category": "Equipment/Labour",
+        }
+
+    parsed_rows = []
+    expected_descs = set()
+    for idx, description in enumerate(personnel_entries, 1):
+        row = _make_force_account_row("FA", idx, description, "Force Account")
+        parsed_rows.append(row)
+        expected_descs.add(_normalize_force_account_description(row["description"]))
+    for idx, description in enumerate(equipment_entries, 1):
+        row = _make_force_account_row("EQ", idx, description, "Force Account Equipment")
+        parsed_rows.append(row)
+        expected_descs.add(_normalize_force_account_description(row["description"]))
+
+    kept_items = []
+    replaced_count = 0
+    for item in items:
+        normalized_desc = _normalize_force_account_description(item.get("description"))
+        if normalized_desc and normalized_desc in expected_descs:
+            replaced_count += 1
+            continue
+        kept_items.append(item)
+
+    if replaced_count:
+        warnings.append(
+            f"Replaced {replaced_count} extracted force account row(s) with deterministic FA/EQ schedule rows"
+        )
+    added_count = max(0, len(parsed_rows) - replaced_count)
+    if added_count:
+        warnings.append(f"Added {added_count} deterministic force account row(s) from schedule text")
+
+    kept_items.extend(parsed_rows)
+    return kept_items, warnings
 
 
 
@@ -2040,7 +2179,7 @@ def build_xlsx(
     # FIX 6: Differentiate force account / equipment rate items from true provisional items
     # Force account items: item_no like P-1, P-2, E-1, E-10 OR descriptions of labour/equipment rates
     import re as _re
-    _fa_no_pat = _re.compile(r"^[PE]-\d+$", _re.IGNORECASE)
+    _fa_no_pat = _re.compile(r"^(?:[PE]|FA|EQ)-\d+$", _re.IGNORECASE)
     _fa_desc_kws = (
         "superintendent", "equipment operator", "labourer", "laborer",
         "compactor", "excavator", "bulldozer", "grader", "loader",
@@ -2370,11 +2509,19 @@ if extract_btn and uploaded:
         filtered_items, lump_sum_warnings = fix_lump_sum_quantities(filtered_items)
         filtered_items, labour_warnings = ensure_labour_rate_items(schedule_text, filtered_items)
         filtered_items, numbered_rate_warnings = ensure_numbered_rate_items(schedule_text, filtered_items)
+        filtered_items, force_account_warnings = ensure_force_account_rate_items(schedule_text, filtered_items, full_text=full_text)
         for item in filtered_items:
             item["category"] = categorize_item(item.get("description", ""), item.get("unit", ""))
             print(f"[DEBUG CAT] item_no={item.get('item_no','?')!r:8} cat={item.get('category','?'):20} desc={str(item.get('description',''))[:80]!r}", file=sys.stderr, flush=True)
         all_validated, val_warnings = validate_extraction(filtered_items)
-        val_warnings = filter_warnings + lump_sum_warnings + labour_warnings + numbered_rate_warnings + val_warnings
+        val_warnings = (
+            filter_warnings
+            + lump_sum_warnings
+            + labour_warnings
+            + numbered_rate_warnings
+            + force_account_warnings
+            + val_warnings
+        )
         items, possible_items = split_items_by_quality(all_validated)
         if possible_items:
             st.info(
