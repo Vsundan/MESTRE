@@ -795,9 +795,13 @@ def fix_lump_sum_quantities(items: list) -> tuple[list, list]:
     warnings = []
     for item in items:
         label = _normalize_item_no(item.get("item_no")) or "row"
+        desc_lower = str(item.get("description") or "").lower()
         qty_raw = item.get("quantity")
         qty_value = _coerce_quantity(qty_raw)
         unit = str(item.get("unit") or "").strip()
+
+        if "hst" in desc_lower or "harmonized sales tax" in desc_lower:
+            continue
 
         if _is_percent_unit(unit):
             item["quantity"] = 1.0
@@ -810,6 +814,34 @@ def fix_lump_sum_quantities(items: list) -> tuple[list, list]:
             if qty_text.endswith("%") or (qty_value is not None and abs(qty_value - 100.0) < 1e-6):
                 item["quantity"] = 1.0
                 warnings.append(f"Item {label}: lump sum quantity '{qty_raw}' corrected to 1")
+
+    return items, warnings
+
+
+def fix_hst_percentage_items(items: list) -> tuple[list, list]:
+    """Normalize HST rows to percentage quantities instead of lump-sum placeholders."""
+    warnings = []
+    for item in items:
+        description = str(item.get("description") or "")
+        if not re.search(r"\b(?:hst|harmonized sales tax)\b", description, re.IGNORECASE):
+            continue
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%", description)
+        if not match:
+            continue
+
+        percent_value = float(match.group(1))
+        if abs(percent_value - round(percent_value)) <= 1e-9:
+            percent_value = int(round(percent_value))
+
+        qty_key = _normalize_quantity_for_matching(item.get("quantity"))
+        unit_key = _normalize_rate_schedule_unit_for_matching(item.get("unit"))
+        if qty_key == percent_value and unit_key == "%":
+            continue
+
+        item["quantity"] = percent_value
+        item["unit"] = "%"
+        label = _normalize_item_no(item.get("item_no")) or "row"
+        warnings.append(f"Item {label}: normalized HST row to quantity={percent_value} unit=%")
 
     return items, warnings
 
@@ -967,6 +999,8 @@ def ensure_numbered_rate_items(schedule_text: str, items: list) -> tuple[list, l
             if not nxt:
                 idx += 1
                 continue
+            if _looks_like_pdf_header_footer_line(nxt):
+                break
             if re.match(r"^\d+\.\s+", nxt) or nxt_upper in {"LABOUR", "EQUIPMENT"}:
                 break
             if nxt_upper in {
@@ -992,6 +1026,9 @@ def ensure_numbered_rate_items(schedule_text: str, items: list) -> tuple[list, l
             idx += 1
 
         description = " ".join(part for part in description_parts if part).strip()
+        description = _clean_rate_schedule_description(description)
+        if not description:
+            continue
         item_no = f"L{number}" if current_group == "LABOUR" else f"E{number}"
         parsed_items.append({
             "item_no": item_no,
@@ -1006,28 +1043,163 @@ def ensure_numbered_rate_items(schedule_text: str, items: list) -> tuple[list, l
     if not parsed_items:
         return items, warnings
 
-    numbered_rate_pat = re.compile(r"^(?:LABOUR-\d+|EQUIPMENT-\d+|L\d+|L-\d+|E\d+|E-\d+)$", re.IGNORECASE)
-    existing_ids = {str(item.get("item_no") or "") for item in items}
-    items[:] = [
-        item for item in items
-        if not numbered_rate_pat.fullmatch(str(item.get("item_no") or "").strip())
-    ]
-    removed_count = len(existing_ids) - len({str(item.get("item_no") or "") for item in items})
-    if removed_count:
-        warnings.append("Replaced extracted labour/equipment rate rows with numbered L#/E# schedule rows")
-
+    added_count = 0
+    skipped_count = 0
+    normalized_count = 0
     for parsed in parsed_items:
-        if parsed["item_no"] not in {str(item.get("item_no") or "") for item in items}:
-            items.append(parsed)
+        match_idx = _find_matching_rate_schedule_item(parsed, items)
+        if match_idx is not None:
+            existing_desc = _clean_rate_schedule_description(items[match_idx].get("description"))
+            if existing_desc and existing_desc != str(items[match_idx].get("description") or "").strip():
+                items[match_idx]["description"] = existing_desc
+                normalized_count += 1
+            skipped_count += 1
+            continue
+
+        same_id_idx = next(
+            (
+                idx for idx, item in enumerate(items)
+                if _normalize_item_no(item.get("item_no")) == parsed["item_no"]
+            ),
+            None,
+        )
+        if same_id_idx is not None:
+            items[same_id_idx].update(parsed)
+            normalized_count += 1
+            continue
+
+        items.append(parsed)
+        added_count += 1
+
+    if skipped_count:
+        warnings.append(
+            f"Skipped {skipped_count} numbered rate row(s) already captured by extraction"
+        )
+    if normalized_count:
+        warnings.append(
+            f"Normalized {normalized_count} numbered rate row(s) to cleaned schedule formatting"
+        )
+    if added_count:
+        warnings.append(f"Added {added_count} numbered L#/E# rate row(s) from schedule text")
 
     return items, warnings
 
+def _looks_like_pdf_header_footer_line(value: object) -> bool:
+    line = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not line:
+        return False
+    lower = line.lower()
+    if re.search(r"\bpage\s*\d+\b", lower) and re.search(
+        r"\b(form of tender|contract\s*no\.?|division\s+\d+|project\s+no\.?|"
+        r"authority|inc\.?|limited|ltd\.?|consulting|engineering|"
+        r"\d{3}-\d{5}-\d{2}|"
+        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{4})\b",
+        lower,
+    ):
+        return True
+    if "form of tender" in lower and (
+        "contract no" in lower or "division " in lower or re.search(r"\d{3}-\d{5}-\d{2}", lower)
+    ):
+        return True
+    return False
 
-def _normalize_force_account_description(value: object) -> str:
-    raw = str(value or "").strip().lower()
-    raw = raw.replace("(complete with operator)", "")
-    raw = re.sub(r"[^a-z0-9]+", " ", raw)
-    return " ".join(raw.split())
+
+def _clean_rate_schedule_description(value: object) -> str:
+    """
+    Remove header/footer fragments that can bleed into parsed rate-schedule
+    descriptions when a table spans page breaks.
+    """
+    raw = str(value or "")
+    if not raw.strip():
+        return ""
+    parts = []
+    for line in raw.splitlines():
+        cleaned_line = re.sub(r"\s+", " ", line).strip()
+        if not cleaned_line or _looks_like_pdf_header_footer_line(cleaned_line):
+            continue
+        parts.append(cleaned_line)
+    cleaned = " ".join(parts) if parts else re.sub(r"\s+", " ", raw).strip()
+
+    tail_markers = (
+        r"\bpage\s*\d+\b",
+        r"\bform\s+of\s+tender\b",
+        r"\bdivision\s+\d+\b",
+        r"\bcontract\s*no\.?\b",
+        r"\bproject\s+no\.?\b",
+        r"\bwsp\s+canada\b",
+        r"\d{3}-\d{5}-\d{2}",
+    )
+    earliest = None
+    for pattern in tail_markers:
+        match = re.search(pattern, cleaned, re.IGNORECASE)
+        if match:
+            earliest = match.start() if earliest is None else min(earliest, match.start())
+    if earliest is not None:
+        cleaned = cleaned[:earliest]
+
+    cleaned = re.sub(
+        r"\s+[A-Z][A-Za-z0-9&.,'’/\-]*(?:\s+[A-Z][A-Za-z0-9&.,'’/\-]*)*\s+"
+        r"(?:Authority|Inc\.?|Ltd\.?|Limited|Corporation|Corp\.?|County|City|"
+        r"Town(?:ship)?|Municipality|Region(?:al)?|Consultants?|Engineering|Canada)$",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -,:;/")
+    return cleaned
+
+
+def _normalize_rate_schedule_unit_for_matching(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[^A-Z%]", "", raw.upper())
+    if normalized in {"HR", "HRS", "HOUR", "HOURS"}:
+        return "hours"
+    if normalized in {"LS", "LUMP", "LUMPSUM"}:
+        return "ls"
+    if normalized in {"PERCENT", "PCT"} or raw == "%":
+        return "%"
+    return raw.lower()
+
+
+def _normalize_quantity_for_matching(value: object) -> object:
+    qty_value = _coerce_quantity(value)
+    if qty_value is None:
+        raw = str(value or "").strip()
+        return None if not raw else raw.lower()
+    if abs(qty_value - round(qty_value)) <= 1e-9:
+        return int(round(qty_value))
+    return round(qty_value, 6)
+
+
+def _rate_schedule_signature(description: object, quantity: object, unit: object) -> tuple[str, object, str]:
+    cleaned_desc = _clean_rate_schedule_description(description).lower()
+    cleaned_desc = re.sub(r"[^a-z0-9]+", " ", cleaned_desc)
+    cleaned_desc = " ".join(cleaned_desc.split())
+    return (
+        cleaned_desc,
+        _normalize_quantity_for_matching(quantity),
+        _normalize_rate_schedule_unit_for_matching(unit),
+    )
+
+
+def _find_matching_rate_schedule_item(parsed_item: dict, items: list) -> int | None:
+    parsed_sig = _rate_schedule_signature(
+        parsed_item.get("description"),
+        parsed_item.get("quantity"),
+        parsed_item.get("unit"),
+    )
+    if not parsed_sig[0]:
+        return None
+    for idx, existing in enumerate(items):
+        existing_sig = _rate_schedule_signature(
+            existing.get("description"),
+            existing.get("quantity"),
+            existing.get("unit"),
+        )
+        if existing_sig == parsed_sig:
+            return idx
+    return None
 
 
 def ensure_force_account_rate_items(schedule_text: str, items: list, full_text: str = "") -> tuple[list, list]:
@@ -1074,6 +1246,8 @@ def ensure_force_account_rate_items(schedule_text: str, items: list, full_text: 
                 lowered = candidate.lower()
                 if not candidate:
                     continue
+                if _looks_like_pdf_header_footer_line(candidate):
+                    continue
                 if lowered == "personnel":
                     current_section = "personnel"
                     continue
@@ -1089,7 +1263,9 @@ def ensure_force_account_rate_items(schedule_text: str, items: list, full_text: 
                 if current_section == "personnel":
                     if re.fullmatch(r"[A-Z][A-Z\s/&()\-]{8,}", candidate):
                         break
-                    local_personnel.append(candidate)
+                    cleaned_candidate = _clean_rate_schedule_description(candidate)
+                    if cleaned_candidate:
+                        local_personnel.append(cleaned_candidate)
                     continue
                 if current_section == "equipment":
                     if lowered == "other (list)":
@@ -1097,7 +1273,9 @@ def ensure_force_account_rate_items(schedule_text: str, items: list, full_text: 
                         break
                     if re.fullmatch(r"[A-Z][A-Z\s/&()\-]{8,}", candidate):
                         break
-                    local_equipment.append(candidate)
+                    cleaned_candidate = _clean_rate_schedule_description(candidate)
+                    if cleaned_candidate:
+                        local_equipment.append(cleaned_candidate)
 
             local_personnel = [entry for entry in local_personnel if entry]
             local_equipment = [entry for entry in local_equipment if entry]
@@ -1114,9 +1292,10 @@ def ensure_force_account_rate_items(schedule_text: str, items: list, full_text: 
         return items, warnings
 
     def _make_force_account_row(prefix: str, number: int, description: str, spec_ref: str) -> dict:
-        normalized_desc = description
+        normalized_desc = _clean_rate_schedule_description(description)
         if prefix == "EQ" and equipment_suffix and "complete with operator" not in description.lower():
             normalized_desc = f"{description}{equipment_suffix}"
+        normalized_desc = _clean_rate_schedule_description(normalized_desc)
         return {
             "item_no": f"{prefix}-{number}",
             "spec_ref": spec_ref,
@@ -1129,35 +1308,62 @@ def ensure_force_account_rate_items(schedule_text: str, items: list, full_text: 
         }
 
     parsed_rows = []
-    expected_descs = set()
     for idx, description in enumerate(personnel_entries, 1):
         row = _make_force_account_row("FA", idx, description, "Force Account")
-        parsed_rows.append(row)
-        expected_descs.add(_normalize_force_account_description(row["description"]))
+        if row["description"]:
+            parsed_rows.append(row)
     for idx, description in enumerate(equipment_entries, 1):
         row = _make_force_account_row("EQ", idx, description, "Force Account Equipment")
-        parsed_rows.append(row)
-        expected_descs.add(_normalize_force_account_description(row["description"]))
+        if row["description"]:
+            parsed_rows.append(row)
 
-    kept_items = []
-    replaced_count = 0
-    for item in items:
-        normalized_desc = _normalize_force_account_description(item.get("description"))
-        if normalized_desc and normalized_desc in expected_descs:
-            replaced_count += 1
+    normalized_count = 0
+    added_count = 0
+    skipped_count = 0
+    for parsed_row in parsed_rows:
+        match_idx = _find_matching_rate_schedule_item(parsed_row, items)
+        if match_idx is not None:
+            existing = items[match_idx]
+            existing.update({
+                "item_no": parsed_row["item_no"],
+                "spec_ref": parsed_row["spec_ref"],
+                "description": parsed_row["description"],
+                "unit": parsed_row["unit"],
+                "is_provisional": False,
+                "category": "Equipment/Labour",
+            })
+            existing["confidence"] = max(float(existing.get("confidence") or 0), parsed_row["confidence"])
+            normalized_count += 1
+            skipped_count += 1
             continue
-        kept_items.append(item)
 
-    if replaced_count:
-        warnings.append(
-            f"Replaced {replaced_count} extracted force account row(s) with deterministic FA/EQ schedule rows"
+        same_id_idx = next(
+            (
+                idx for idx, item in enumerate(items)
+                if _normalize_item_no(item.get("item_no")) == parsed_row["item_no"]
+            ),
+            None,
         )
-    added_count = max(0, len(parsed_rows) - replaced_count)
+        if same_id_idx is not None:
+            items[same_id_idx].update(parsed_row)
+            normalized_count += 1
+            continue
+
+        items.append(parsed_row)
+        added_count += 1
+
+    if skipped_count:
+        warnings.append(
+            f"Skipped {skipped_count} force account row(s) already captured by extraction"
+        )
+    if normalized_count:
+        warnings.append(
+            f"Normalized {normalized_count} force account row(s) to deterministic FA/EQ formatting"
+        )
     if added_count:
         warnings.append(f"Added {added_count} deterministic force account row(s) from schedule text")
 
-    kept_items.extend(parsed_rows)
-    return kept_items, warnings
+    return items, warnings
 
 
 
@@ -2981,6 +3187,7 @@ if extract_btn and uploaded:
     # Step 5: Validate + split by quality
     with st.spinner("Validating extraction..."):
         filtered_items, filter_warnings = filter_non_schedule_items(items_raw)
+        filtered_items, hst_warnings = fix_hst_percentage_items(filtered_items)
         filtered_items, lump_sum_warnings = fix_lump_sum_quantities(filtered_items)
         filtered_items, labour_warnings = ensure_labour_rate_items(schedule_text, filtered_items)
         filtered_items, numbered_rate_warnings = ensure_numbered_rate_items(schedule_text, filtered_items)
@@ -2991,6 +3198,7 @@ if extract_btn and uploaded:
         all_validated, val_warnings = validate_extraction(filtered_items)
         val_warnings = (
             filter_warnings
+            + hst_warnings
             + lump_sum_warnings
             + labour_warnings
             + numbered_rate_warnings
