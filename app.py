@@ -10,6 +10,7 @@ import anthropic
 import json
 import re
 import time
+import traceback
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -108,6 +109,7 @@ def get_opss_notes_from_db(opss_numbers: list) -> dict:
                 combined = " ".join(results["documents"][0])
                 notes[num] = combined[:200].rsplit(" ", 1)[0] + "..."
     except Exception:
+        traceback.print_exc(file=sys.stderr)
         notes = {}
 
     # Fill gaps with hardcoded fallback
@@ -1316,6 +1318,7 @@ def call_claude_for_checklist(client: anthropic.Anthropic, front_matter: str) ->
             if s != -1 and e > s:
                 return json.loads(raw[s:e])
         except Exception as ex:
+            traceback.print_exc(file=sys.stderr)
             st.warning(f"Checklist extraction failed: {ex}")
     return []
 
@@ -1346,6 +1349,7 @@ def call_claude_for_timeline(client: anthropic.Anthropic, front_matter: str) -> 
             if s != -1 and e > s:
                 return json.loads(raw[s:e])
         except Exception as ex:
+            traceback.print_exc(file=sys.stderr)
             st.warning(f"Timeline extraction failed: {ex}")
     return []
 
@@ -1392,6 +1396,7 @@ def call_claude_for_opss_full_scan(client: anthropic.Anthropic, full_text: str) 
                         deduped.append(entry)
                 return deduped
         except Exception as ex:
+            traceback.print_exc(file=sys.stderr)
             st.warning(f"OPSS full scan failed: {ex}")
     return []
 
