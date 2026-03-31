@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import uuid
-from datetime import date
+from datetime import date, datetime, timedelta
 import streamlit as st
 import fitz
 import anthropic
@@ -54,7 +54,7 @@ OPSS_NOTES = {
     "421": "Pipe Culverts — installation, end treatment, bedding",
     "441": "Watermain — installation, disinfection, pressure testing",
     "442": "Cathodic Protection — anodes, test stations, connections",
-    "491": "Structural Steel — fabrication, erection, coatings",
+    "491": "Temporary Flow Control During Sewer and Watermain Construction",
     "493": "Temporary Water Supply — bypass, distribution, testing",
     "501": "Compacting — density requirements, testing frequency",
     "510": "Removals — existing structures, pavement, pipe",
@@ -1474,6 +1474,60 @@ def detect_project_type(full_text: str, items: list) -> str:
     return best[0]
 
 
+def _parse_tender_date(value: object) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.split("@", 1)[0].strip()
+    raw = re.sub(r"\s+", " ", raw)
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _find_timeline_date(timeline_items: list, keywords: tuple[str, ...]) -> date | None:
+    for item in timeline_items:
+        haystack = " ".join(
+            str(item.get(field) or "").lower()
+            for field in ("event", "risk_note", "date")
+        )
+        if any(keyword in haystack for keyword in keywords):
+            parsed = _parse_tender_date(item.get("date"))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _count_weekdays_inclusive(start: date, end: date) -> int:
+    if end < start:
+        return 0
+    days = 0
+    current = start
+    while current <= end:
+        if current.weekday() < 5:
+            days += 1
+        current += timedelta(days=1)
+    return days
+
+
+def _extract_bridge_work_window(timeline_items: list) -> dict | None:
+    start_date = _find_timeline_date(timeline_items, ("in-water", "shoreline"))
+    end_date = _find_timeline_date(timeline_items, ("completion", "final completion"))
+    if start_date is None or end_date is None or end_date < start_date:
+        return None
+    calendar_days = (end_date - start_date).days + 1
+    working_days = _count_weekdays_inclusive(start_date, end_date)
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "calendar_days": calendar_days,
+        "working_days": working_days,
+    }
+
+
 def generate_project_type_risks(project_type: str, full_text: str, items: list,
                                   timeline_items: list) -> list:
     """FIX 4+5: Generate project-type-aware risk flags."""
@@ -1483,13 +1537,20 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
     prov_count = sum(1 for i in items if i.get("is_provisional"))
     total_count = len(items)
 
+    bridge_window = None
+    if project_type in ("BRIDGE_REHAB", "BRIDGE_REPLACEMENT"):
+        bridge_window = _extract_bridge_work_window(timeline_items)
+
     # Extract working days from timeline
     working_days = None
-    for t in timeline_items:
-        wd = t.get("working_days")
-        if wd and isinstance(wd, (int, float)) and wd > 0:
-            working_days = int(wd)
-            break
+    if bridge_window is not None:
+        working_days = bridge_window["working_days"]
+    else:
+        for t in timeline_items:
+            wd = t.get("working_days")
+            if wd and isinstance(wd, (int, float)) and wd > 0:
+                working_days = int(wd)
+                break
 
     # Extract liquidated damages from timeline
     ld_per_day = None
@@ -1506,7 +1567,18 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
                     pass
 
     # ── Universal checks ──────────────────────────────────────────────────────
-    if working_days is not None and working_days < 60:
+    if bridge_window is not None:
+        start_label = bridge_window["start_date"].strftime("%B %d, %Y").replace(" 0", " ")
+        end_label = bridge_window["end_date"].strftime("%B %d, %Y").replace(" 0", " ")
+        risks.append({
+            "item": "CONTRACT", "severity": "HIGH",
+            "risk": (
+                f"Compressed in-water work window: {bridge_window['calendar_days']} calendar days "
+                f"({bridge_window['working_days']} working days) from {start_label} to {end_label}"
+            ),
+            "advice": "Front-load labour, materials, and access works. Any weather or permit delay will hit the critical path.",
+        })
+    elif working_days is not None and working_days < 60:
         risks.append({
             "item": "CONTRACT", "severity": "HIGH",
             "risk": f"Compressed schedule: only {working_days} working days",
@@ -1573,7 +1645,7 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
                 "risk": "Navigable waterway — Transport Canada permit likely required",
                 "advice": "Transport Canada Navigable Waters Protection Act approval adds timeline risk.",
             })
-        if any(kw in text_lower for kw in ["in-water work window", "fish habitat", "spawning", "dfo",
+        if bridge_window is None and any(kw in text_lower for kw in ["in-water work window", "fish habitat", "spawning", "dfo",
                                              "in-water work", "work window"]):
             risks.append({
                 "item": "IN-WATER", "severity": "HIGH",
