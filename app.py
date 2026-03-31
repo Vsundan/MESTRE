@@ -130,7 +130,12 @@ CATEGORIES = {
     # (e.g. "paving" in driveway/boulevard context is handled explicitly).
     "Asphalt": ["asphalt", "hot mix", "hma", "superpave", "tack coat", "milling",
                 "paving", "boulevard pav", "driveway pav"],
-    "Concrete": ["concrete", "formwork", "rebar", "reinforc", "curing"],
+    "Concrete": [
+        "concrete", "formwork", "rebar", "reinforc", "curing",
+        "sidewalk", "concrete sidewalk", "concrete slab", "concrete repair",
+        "concrete restoration", "mudjacking", "mud jacking", "mud-jacking",
+        "curb and gutter",
+    ],
     # FIX 2: Structural/Masonry — bridge rehab, heritage, masonry repair scope
     "Structural": [
         "masonry", "repointing", "mortar", "stone resetting", "stone repair",
@@ -175,7 +180,7 @@ EXCLUSION_KEYWORDS = [
 ]
 
 CHECKLIST_CATEGORIES = ["Form", "Insurance", "Bonding", "WSIB", "Certificate",
-                         "Schedule", "Document", "Other"]
+                         "Schedule", "Document", "Submission Requirement", "Other"]
 TIMELINE_FLAGS = ["DEADLINE", "MILESTONE", "PENALTY", "MEETING", "INFO"]
 
 CHUNK_SIZE          = 100_000
@@ -286,6 +291,12 @@ def categorize_item(description: str, unit: str = "") -> str:
     if "inspection" in desc_lower and any(kw in desc_lower for kw in ("pipe", "leachate", "sewer", "culvert")):
         return "Pipe/Sewer"
 
+    # Concrete maintenance scope: only treat lifting/levelling as concrete when
+    # the same description clearly refers to sidewalk/concrete/slab/curb work.
+    if any(kw in desc_lower for kw in ("lifting", "levelling", "leveling")):
+        if any(ctx in desc_lower for ctx in ("sidewalk", "concrete", "slab", "curb and gutter")):
+            return "Concrete"
+
     for cat, keywords in CATEGORIES.items():
         if cat == "General":
             continue
@@ -339,6 +350,168 @@ def extract_opss_from_full_text(full_text: str) -> list:
         if code in OPSS_NOTES:
             found.add(code)
     return sorted(found, key=lambda x: int(x) if x.isdigit() else 9999)
+
+
+def extract_other_standards_from_full_text(full_text: str) -> list[dict]:
+    """
+    Capture non-OPSS standards references for tenders that cite compliance
+    standards but do not include OPSS codes.
+    """
+    patterns = [
+        (
+            "OTM Book 7",
+            r"(?:Ontario Traffic Manual\s*\(\s*Book\s*7\s*\)|Ontario Traffic Manual.{0,40}Book\s*7|OTM\s*Book\s*7)",
+            "Ontario Traffic Manual — Temporary Conditions (traffic control for construction zones)",
+        ),
+        (
+            "OHSA",
+            r"(?:Occupational Health\s*&?\s*Safety Act)",
+            "Occupational Health & Safety Act — workplace safety compliance",
+        ),
+        (
+            "WHMIS",
+            r"\bWHMIS\b",
+            "Workplace Hazardous Materials Information System — labeling and SDS compliance",
+        ),
+        (
+            "AODA",
+            r"(?:Accessibility for Ontarians with Disabilities)",
+            "Accessibility for Ontarians with Disabilities Act",
+        ),
+        (
+            "CSA",
+            r"(?:Canadian Standard Association|Canadian Standards Association|\bCSA\b)",
+            "Canadian Standards Association — product and equipment approvals",
+        ),
+        (
+            "CCDC 2",
+            r"\bCCDC\s*2\b",
+            "Canadian Construction Documents Committee — Stipulated Price Contract",
+        ),
+        (
+            "NBC",
+            r"(?:National Building Code|\bNBC\b)",
+            "National Building Code of Canada",
+        ),
+        (
+            "OBC",
+            r"(?:Ontario Building Code|\bOBC\b)",
+            "Ontario Building Code",
+        ),
+    ]
+    found = []
+    seen = set()
+    for code, pattern, description in patterns:
+        if re.search(pattern, full_text, re.IGNORECASE):
+            if code not in seen:
+                seen.add(code)
+                found.append({"code": code, "description": description})
+    return found
+
+
+def build_checklist_source_text(full_text: str) -> str:
+    """
+    Front matter usually contains standard bid forms, but custom submission
+    requirements often live in scope/specification sections. Keep the prompt
+    focused by appending the earliest spec block when available.
+    """
+    if len(full_text) <= FRONT_MATTER_CHARS:
+        return full_text
+
+    front = full_text[:FRONT_MATTER_CHARS]
+    spec_start = None
+    for marker in ("SPECIFICATIONS", "SCOPE OF WORK", "DETAIL", "SPECIAL PROVISIONS"):
+        idx = full_text.upper().find(marker)
+        if idx != -1 and idx > 0:
+            if spec_start is None or idx < spec_start:
+                spec_start = idx
+
+    if spec_start is None:
+        return front
+
+    spec_chunk = full_text[spec_start: spec_start + (FRONT_MATTER_CHARS // 2)]
+    if spec_chunk and spec_chunk not in front:
+        return front + "\n\n" + spec_chunk
+    return front
+
+
+def _extract_sentence_like_excerpt(full_text: str, pattern: str, context_chars: int = 180) -> str:
+    match = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    start = max(0, match.start() - context_chars)
+    end = min(len(full_text), match.end() + context_chars)
+    excerpt = re.sub(r"\s+", " ", full_text[start:end]).strip()
+    return excerpt[:220]
+
+
+def _parse_irrevocable_days(full_text: str, timeline_items: list) -> int | None:
+    for item in timeline_items:
+        haystack = " ".join(str(item.get(field) or "") for field in ("event", "date", "risk_note"))
+        m = re.search(r"(\d+)\s*day", haystack, re.IGNORECASE)
+        if "irrevoc" in haystack.lower() and m:
+            return int(m.group(1))
+
+    text_lower = full_text.lower()
+    word_map = {
+        "thirty": 30,
+        "sixty": 60,
+        "ninety": 90,
+        "one hundred and twenty": 120,
+        "one-hundred-and-twenty": 120,
+    }
+    for match in re.finditer(r"irrevoc", text_lower):
+        window = text_lower[match.start(): match.start() + 260]
+        digit_match = re.search(r"\(?\b(\d{1,3})\b\)?\s*day", window)
+        if digit_match:
+            return int(digit_match.group(1))
+        for words, value in word_map.items():
+            if re.search(rf"{re.escape(words)}\s*(?:\(\s*\d+\s*\))?\s*day", window):
+                return value
+    return None
+
+
+def check_if_item_is_bundled(item_keywords: tuple[str, ...], full_text: str) -> tuple[bool, str]:
+    """
+    Check whether a missing-scope item is explicitly bundled into contract price,
+    assigned to the owner, or stated as not required.
+    """
+    if not full_text:
+        return (False, "")
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in full_text.splitlines()]
+    lines = [line for line in lines if line]
+
+    included_markers = (
+        "included in the contract price",
+        "included in the price",
+        "shall be included",
+        "included in contract price",
+        "no extra cost",
+        "no additional cost",
+    )
+    owner_markers = (
+        "responsibility of the city",
+        "responsibility of the owner",
+        "provided by the city",
+        "provided by the owner",
+        "will be the responsibility of the city",
+        "will be the responsibility of the owner",
+    )
+    not_required_markers = ("not required", "not applicable")
+
+    for idx, line in enumerate(lines):
+        window = " ".join(lines[max(0, idx - 3): min(len(lines), idx + 4)]).lower()
+        if not any(keyword in window for keyword in item_keywords):
+            continue
+        if any(marker in window for marker in included_markers):
+            return (True, "Included in contract price per tender specifications")
+        if any(marker in window for marker in owner_markers):
+            return (True, "Owner/City responsibility per tender specifications")
+        if any(marker in window for marker in not_required_markers):
+            return (True, "Not required per tender specifications")
+
+    return (False, "")
 
 
 _NON_SCHEDULE_ITEM_NO_VALUES = {"", "nan", "none", "null"}
@@ -1430,21 +1603,28 @@ def extract_tender_header(full_text: str) -> dict:
     return header
 
 
-def call_claude_for_checklist(client: anthropic.Anthropic, front_matter: str) -> list:
+def call_claude_for_checklist(client: anthropic.Anthropic, checklist_source_text: str) -> list:
     """Upgrade 1: extract bid submission requirements."""
     prompt = (
         "You are a Canadian construction tender compliance specialist. "
         "Read this tender document and extract EVERY submission requirement the contractor must meet "
         "to submit a valid bid. Return a JSON array where each object has: "
         '{"requirement": "...", "category": one of ["Form","Insurance","Bonding","WSIB",'
-        '"Certificate","Schedule","Document","Other"], '
+        '"Certificate","Schedule","Document","Submission Requirement","Other"], '
         '"page_reference": "page X or null", "deadline": "date/timing or null", '
         '"critical": true if missing this disqualifies the bid}. '
         "Extract: bid bond, insurance certificates, WSIB clearance, agreement to bond, "
         "addenda acknowledgment, tender deposit, tender closing date/time, mandatory site meeting, "
         "HST registration, required forms. "
+        "CUSTOM SUBMISSION REQUIREMENTS: scan specification and scope sections for non-standard bid-package "
+        "requirements such as proposed methods, work plans, alternate-product submissions, or approaches "
+        "that the bidder must include with the tender. Look for phrases like 'shall submit', "
+        "'must be submitted with the bid', 'submit this proposed method as part of the tender', "
+        "'provide with the tender', or 'attach to the tender'. "
+        "Label these as category 'Submission Requirement' and mark them critical when the tender says "
+        "they must be part of the submission. "
         "Return ONLY valid JSON array — no markdown, no backticks.\n\n"
-        f"TENDER DOCUMENT:\n{front_matter}"
+        f"TENDER DOCUMENT:\n{checklist_source_text}"
     )
     with st.spinner("Extracting bid submission checklist..."):
         try:
@@ -1545,11 +1725,48 @@ def detect_project_type(full_text: str, items: list) -> str:
     text_lower = full_text.lower()[:50000]
     all_desc = " ".join(str(i.get("description", "")).lower() for i in items)
 
+    # High-confidence override for service / maintenance contracts. This must
+    # run before score-based detection because Roads Division tenders can
+    # mention "road" without being road reconstruction projects.
+    maintenance_primary = (
+        "lifting and levelling",
+        "lifting and leveling",
+        "crack sealing",
+        "mudjacking",
+        "mud jacking",
+        "mud-jacking",
+        "line painting",
+        "pothole patching",
+        "pothole repair",
+        "street sweeping",
+        "grass cutting",
+    )
+    if any(keyword in text_lower for keyword in maintenance_primary):
+        return "MAINTENANCE"
+
+    maintenance_secondary = [
+        "vendor of record",
+        "no guarantee of the value or volume",
+        "option to renew",
+        "actual measured",
+        "measured in the field",
+        "estimated quantity",
+    ]
+    secondary_hits = sum(1 for keyword in maintenance_secondary if keyword in text_lower)
+    if "maintenance" in text_lower and "maintenance of traffic" not in text_lower:
+        secondary_hits += 1
+    surface_terms = ("sidewalk", "patching", "sweeping", "curb", "pothole", "line painting")
+    surface_hit = any(term in text_lower or term in all_desc for term in surface_terms)
+    low_item_count = 0 < len(items) <= 5
+    if surface_hit and (secondary_hits >= 3 or (secondary_hits >= 2 and low_item_count)):
+        return "MAINTENANCE"
+
     # Score each project type based on keyword frequency
     scores = {
         "BRIDGE_REHAB": 0,
         "BRIDGE_REPLACEMENT": 0,
         "SEWER_WATERMAIN": 0,
+        "MAINTENANCE": 0,
         "ROAD_RECONSTRUCTION": 0,
         "LANDFILL": 0,
         "CULVERT": 0,
@@ -1667,6 +1884,51 @@ def _extract_bridge_work_window(timeline_items: list) -> dict | None:
     }
 
 
+def _extract_relevant_schedule_working_days(timeline_items: list) -> int | None:
+    """
+    Pull schedule-compression candidates from timeline rows that actually
+    describe the contract work period or a completion deadline, not admin
+    milestones like award, insurance, or certificate turnaround.
+    """
+    candidate_keywords = (
+        "completion",
+        "substantial completion",
+        "final completion",
+        "must be completed",
+        "work window",
+        "construction period",
+        "construction duration",
+        "duration",
+        "working days to complete",
+        "calendar days to complete",
+        "contract completion",
+    )
+    excluded_keywords = (
+        "award anticipated",
+        "questions/inquiries",
+        "insurance evidence",
+        "certificates required",
+        "warranty",
+        "contract term",
+        "option to renew",
+        "irrevocable",
+    )
+    candidates = []
+    for item in timeline_items:
+        wd = item.get("working_days")
+        if not isinstance(wd, (int, float)) or wd <= 0:
+            continue
+        haystack = " ".join(
+            str(item.get(field) or "").lower()
+            for field in ("event", "risk_note", "date")
+        )
+        if any(keyword in haystack for keyword in excluded_keywords):
+            continue
+        if any(keyword in haystack for keyword in candidate_keywords):
+            candidates.append(int(wd))
+    return min(candidates) if candidates else None
+
+
 def generate_project_type_risks(project_type: str, full_text: str, items: list,
                                   timeline_items: list) -> list:
     """FIX 4+5: Generate project-type-aware risk flags."""
@@ -1675,6 +1937,35 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
     all_desc = " ".join(str(i.get("description", "")).lower() for i in items)
     prov_count = sum(1 for i in items if i.get("is_provisional"))
     total_count = len(items)
+
+    def _has_item_keywords(*keywords: str) -> bool:
+        return any(keyword in all_desc for keyword in keywords)
+
+    def _append_scope_risk_or_info(
+        label: str,
+        item_keywords: tuple[str, ...],
+        bundled_keywords: tuple[str, ...],
+        severity: str,
+        risk_text: str,
+        advice: str,
+    ) -> None:
+        if _has_item_keywords(*item_keywords):
+            return
+        is_bundled, explanation = check_if_item_is_bundled(bundled_keywords, full_text)
+        if is_bundled:
+            risks.append({
+                "item": "INFO",
+                "severity": "INFO",
+                "risk": f"{label}: no separate line item — {explanation}",
+                "advice": "Tender text addresses this scope outside the pricing schedule.",
+            })
+        else:
+            risks.append({
+                "item": "MISSING",
+                "severity": severity,
+                "risk": risk_text,
+                "advice": advice,
+            })
 
     bridge_window = None
     if project_type in ("BRIDGE_REHAB", "BRIDGE_REPLACEMENT"):
@@ -1685,11 +1976,7 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
     if bridge_window is not None:
         working_days = bridge_window["working_days"]
     else:
-        for t in timeline_items:
-            wd = t.get("working_days")
-            if wd and isinstance(wd, (int, float)) and wd > 0:
-                working_days = int(wd)
-                break
+        working_days = _extract_relevant_schedule_working_days(timeline_items)
 
     # Extract liquidated damages from timeline
     ld_per_day = None
@@ -1754,18 +2041,22 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
 
     # ── Bridge Rehab specific checks ──────────────────────────────────────────
     if project_type in ("BRIDGE_REHAB", "BRIDGE_REPLACEMENT"):
-        if not any(kw in all_desc for kw in ["traffic control", "traffic management", "tcp"]):
-            risks.append({
-                "item": "MISSING", "severity": "HIGH",
-                "risk": "No traffic control plan item found — required for bridge work",
-                "advice": "Verify traffic control provisions in Special Conditions before bidding.",
-            })
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment", "environmental"]):
-            risks.append({
-                "item": "MISSING", "severity": "MEDIUM",
-                "risk": "No erosion control / environmental protection items found",
-                "advice": "Check if environmental protection is included in a lump sum or provisional item.",
-            })
+        _append_scope_risk_or_info(
+            "Traffic control",
+            ("traffic control", "traffic management", "tcp"),
+            ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+            "HIGH",
+            "No traffic control plan item found — required for bridge work",
+            "Verify traffic control provisions in Special Conditions before bidding.",
+        )
+        _append_scope_risk_or_info(
+            "Environmental protection",
+            ("erosion", "silt", "sediment", "environmental"),
+            ("erosion", "sediment", "silt", "environmental protection"),
+            "MEDIUM",
+            "No erosion control / environmental protection items found",
+            "Check if environmental protection is included in a lump sum or provisional item.",
+        )
         if not any(kw in all_desc for kw in ["scaffold", "work platform", "access"]):
             risks.append({
                 "item": "MISSING", "severity": "MEDIUM",
@@ -1820,29 +2111,43 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
     # ── Sewer/Watermain specific checks ──────────────────────────────────────
     elif project_type == "SEWER_WATERMAIN":
         if "dewater" not in all_desc and "dewater" not in text_lower[:20000]:
-            risks.append({
-                "item": "MISSING", "severity": "HIGH",
-                "risk": "No dewatering items found — high risk if high water table",
-                "advice": "Confirm groundwater conditions. Unpriced dewatering = significant cost risk.",
-            })
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment"]):
-            risks.append({
-                "item": "MISSING", "severity": "MEDIUM",
-                "risk": "No erosion control items found",
-                "advice": "Confirm if erosion control is included in trench restoration or a separate item.",
-            })
-        if not any(kw in all_desc for kw in ["traffic control", "traffic management"]):
-            risks.append({
-                "item": "MISSING", "severity": "HIGH",
-                "risk": "No traffic control items found — required for sewer/watermain work",
-                "advice": "Verify traffic control requirements with municipality. TCP approval timeline.",
-            })
-        if not any(kw in all_desc for kw in ["restoration", "trench restoration", "topsoil", "seed"]):
-            risks.append({
-                "item": "MISSING", "severity": "MEDIUM",
-                "risk": "No trench restoration items found",
-                "advice": "Confirm trench restoration scope — asphalt cut, backfill, surface restoration.",
-            })
+            is_bundled, explanation = check_if_item_is_bundled(("dewatering", "dewater"), full_text)
+            if is_bundled:
+                risks.append({
+                    "item": "INFO", "severity": "INFO",
+                    "risk": f"Dewatering: no separate line item — {explanation}",
+                    "advice": "Tender text addresses this scope outside the pricing schedule.",
+                })
+            else:
+                risks.append({
+                    "item": "MISSING", "severity": "HIGH",
+                    "risk": "No dewatering items found — high risk if high water table",
+                    "advice": "Confirm groundwater conditions. Unpriced dewatering = significant cost risk.",
+                })
+        _append_scope_risk_or_info(
+            "Erosion control",
+            ("erosion", "silt", "sediment"),
+            ("erosion", "sediment", "silt"),
+            "MEDIUM",
+            "No erosion control items found",
+            "Confirm if erosion control is included in trench restoration or a separate item.",
+        )
+        _append_scope_risk_or_info(
+            "Traffic control",
+            ("traffic control", "traffic management"),
+            ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+            "HIGH",
+            "No traffic control items found — required for sewer/watermain work",
+            "Verify traffic control requirements with municipality. TCP approval timeline.",
+        )
+        _append_scope_risk_or_info(
+            "Site restoration",
+            ("restoration", "trench restoration", "topsoil", "seed"),
+            ("restoration", "topsoil", "seed", "boulevard"),
+            "MEDIUM",
+            "No trench restoration items found",
+            "Confirm trench restoration scope — asphalt cut, backfill, surface restoration.",
+        )
         if "bypass" not in all_desc and "bypass pump" not in text_lower[:30000]:
             if any(kw in all_desc for kw in ["sanitary sewer", "sanitary pipe", "maintenance hole"]):
                 risks.append({
@@ -1863,20 +2168,82 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
                 "advice": "Deep excavation requires P.Eng. shoring design and specialized equipment.",
             })
 
+    # ── Maintenance contract specific checks ──────────────────────────────────
+    elif project_type == "MAINTENANCE":
+        weather_excerpt = _extract_sentence_like_excerpt(
+            full_text, r"suspended during periods of rain.{0,120}below\s*2"
+        )
+        if weather_excerpt:
+            risks.append({
+                "item": "WEATHER", "severity": "HIGH",
+                "risk": f"Weather restrictions apply: {weather_excerpt}",
+                "advice": "Outdoor work is suspended during rain and below 2C. Price mobilization and crew utilization for a compressed warm-weather season.",
+            })
+        else:
+            risks.append({
+                "item": "WEATHER", "severity": "INFO",
+                "risk": "No explicit weather shutdown clause detected",
+                "advice": "Confirm whether seasonal or temperature restrictions apply before pricing field operations.",
+            })
+
+        if re.search(r"estimates? only|no guarantee of the value or volume|subject to vary", text_lower):
+            risks.append({
+                "item": "VOLUME", "severity": "HIGH",
+                "risk": "Quantities are estimates only — no guaranteed volume",
+                "advice": "Build fixed-cost recovery into your unit rate so mobilization, insurance, and equipment costs are covered even if actual quantities are lower than estimated.",
+            })
+
+        liability_excerpt = _extract_sentence_like_excerpt(
+            full_text,
+            r"responsibility of the bidder|breakage due to over lifting|damage deemed excessive",
+        )
+        if liability_excerpt:
+            risks.append({
+                "item": "LIABILITY", "severity": "MEDIUM",
+                "risk": f"Bidder is liable for breakage and workmanship defects: {liability_excerpt}",
+                "advice": "Inspect existing conditions carefully and carry contingency for slab damage, rework, and replacement exposure.",
+            })
+
+        if re.search(r"cash discount.{0,120}(award|consideration|taken into consideration)", text_lower, re.DOTALL):
+            risks.append({
+                "item": "AWARD", "severity": "MEDIUM",
+                "risk": "Cash discount is part of award evaluation",
+                "advice": "Prompt-payment discount terms can influence award. Consider whether a competitive discount strengthens the bid without harming cash flow.",
+            })
+
+        irrevocable_days = _parse_irrevocable_days(full_text, timeline_items)
+        if irrevocable_days and irrevocable_days > 90:
+            risks.append({
+                "item": "IRREVOCABLE", "severity": "MEDIUM",
+                "risk": f"Tender is irrevocable for {irrevocable_days} days ({round(irrevocable_days / 30, 1):g} months)",
+                "advice": "Hold pricing for the full irrevocable period and account for seasonal labour and material availability changes.",
+            })
+
+        if "option to renew" in text_lower and re.search(r"prices?.{0,60}firm|firm.{0,60}first year", text_lower, re.DOTALL):
+            risks.append({
+                "item": "RENEWAL", "severity": "MEDIUM",
+                "risk": "Contract renewal terms exist but pricing flexibility may be limited",
+                "advice": "Clarify whether renewal-year pricing can be adjusted. If not, build inflation and wage escalation risk into the first-year rate.",
+            })
+
     # ── Road Reconstruction specific checks ───────────────────────────────────
     elif project_type == "ROAD_RECONSTRUCTION":
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment"]):
-            risks.append({
-                "item": "MISSING", "severity": "MEDIUM",
-                "risk": "No erosion control items found",
-                "advice": "Required during construction. May be included in mobilization/general conditions.",
-            })
-        if not any(kw in all_desc for kw in ["traffic control", "traffic management"]):
-            risks.append({
-                "item": "MISSING", "severity": "HIGH",
-                "risk": "No traffic control items found",
-                "advice": "Required for all road work. Confirm TCP requirements with municipal engineer.",
-            })
+        _append_scope_risk_or_info(
+            "Erosion control",
+            ("erosion", "silt", "sediment"),
+            ("erosion", "sediment", "silt"),
+            "MEDIUM",
+            "No erosion control items found",
+            "Required during construction. May be included in mobilization/general conditions.",
+        )
+        _append_scope_risk_or_info(
+            "Traffic control",
+            ("traffic control", "traffic management"),
+            ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+            "HIGH",
+            "No traffic control items found",
+            "Required for all road work. Confirm TCP requirements with municipal engineer.",
+        )
         if "october 15" in text_lower or "october 31" in text_lower:
             risks.append({
                 "item": "SEASONAL", "severity": "HIGH",
@@ -1886,12 +2253,14 @@ def generate_project_type_risks(project_type: str, full_text: str, items: list,
 
     # ── Landfill specific checks ──────────────────────────────────────────────
     elif project_type == "LANDFILL":
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment"]):
-            risks.append({
-                "item": "MISSING", "severity": "MEDIUM",
-                "risk": "No erosion control items found",
-                "advice": "Required for landfill site work. Check if included in earthwork items.",
-            })
+        _append_scope_risk_or_info(
+            "Erosion control",
+            ("erosion", "silt", "sediment"),
+            ("erosion", "sediment", "silt"),
+            "MEDIUM",
+            "No erosion control items found",
+            "Required for landfill site work. Check if included in earthwork items.",
+        )
         if not any(kw in all_desc for kw in ["leachate", "leachate pipe", "leachate collect"]):
             risks.append({
                 "item": "MISSING", "severity": "MEDIUM",
@@ -1923,67 +2292,145 @@ def build_project_type_risk_section(project_type: str, risks: list) -> list:
     return formatted
 
 
-def generate_missing_warnings(project_type: str, items: list) -> list:
+def generate_missing_warnings(project_type: str, items: list, full_text: str = "") -> tuple[list, list]:
     """
     FIX 3: Generate project-type-aware missing scope warnings.
     Replaces the hardcoded 4-warning block that incorrectly fired for all project types.
     BRIDGE_REHAB: check traffic control, environmental protection, access/scaffolding only.
     SEWER_WATERMAIN: dewatering, erosion, traffic, restoration.
+    MAINTENANCE: skip infrastructure warnings that do not apply to service contracts.
     ROAD_RECONSTRUCTION: traffic, erosion, restoration.
     LANDFILL: environmental, leachate, erosion.
     DEFAULT: original generic 4-warning set.
     """
     warnings = []
+    info_notes = []
     all_desc = " ".join(str(it.get("description", "")).lower() for it in items)
+
+    def _has_item_keywords(*keywords: str) -> bool:
+        return any(keyword in all_desc for keyword in keywords)
+
+    def _add_warning_or_info(
+        message: str,
+        item_keywords: tuple[str, ...],
+        bundled_keywords: tuple[str, ...],
+    ) -> None:
+        if _has_item_keywords(*item_keywords):
+            return
+        is_bundled, explanation = check_if_item_is_bundled(bundled_keywords, full_text)
+        if is_bundled:
+            info_notes.append(f"{message.replace('No ', '').replace(' found', '')}: no separate line item — {explanation}")
+        else:
+            warnings.append(message)
 
     if project_type in ("BRIDGE_REHAB", "BRIDGE_REPLACEMENT"):
         # Bridge rehab: traffic control, environmental protection, access/scaffolding
         # Do NOT warn about dewatering, site restoration, granular backfill, topsoil/sod
-        if not any(kw in all_desc for kw in ["traffic control", "traffic management", "tcp", "traffic"]):
-            warnings.append("No traffic control items found")
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment", "environmental"]):
-            warnings.append("No environmental protection / erosion control items found")
-        if not any(kw in all_desc for kw in ["scaffold", "work platform", "access to work area", "access"]):
+        _add_warning_or_info(
+            "No traffic control items found",
+            ("traffic control", "traffic management", "tcp", "traffic"),
+            ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+        )
+        _add_warning_or_info(
+            "No environmental protection / erosion control items found",
+            ("erosion", "silt", "sediment", "environmental"),
+            ("erosion", "silt", "sediment", "environmental protection"),
+        )
+        if not _has_item_keywords("scaffold", "work platform", "access to work area", "access"):
             warnings.append("No access / scaffolding provisions found (OPSS 928 may apply)")
 
     elif project_type == "SEWER_WATERMAIN":
-        if "dewater" not in all_desc:
-            warnings.append("No dewatering items found")
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment"]):
-            warnings.append("No erosion control items found")
-        if not any(kw in all_desc for kw in ["traffic", "sign"]):
-            warnings.append("No traffic control items found")
-        if not any(kw in all_desc for kw in ["restoration", "topsoil", "seed"]):
-            warnings.append("No site restoration items found")
+        _add_warning_or_info(
+            "No dewatering items found",
+            ("dewater",),
+            ("dewatering", "dewater"),
+        )
+        _add_warning_or_info(
+            "No erosion control items found",
+            ("erosion", "silt", "sediment"),
+            ("erosion", "silt", "sediment"),
+        )
+        _add_warning_or_info(
+            "No traffic control items found",
+            ("traffic", "sign"),
+            ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+        )
+        _add_warning_or_info(
+            "No site restoration items found",
+            ("restoration", "topsoil", "seed"),
+            ("restoration", "topsoil", "seed", "boulevard"),
+        )
+
+    elif project_type == "MAINTENANCE":
+        if not _has_item_keywords("traffic", "sign", "traffic control"):
+            is_bundled, explanation = check_if_item_is_bundled(
+                ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+                full_text,
+            )
+            if is_bundled:
+                info_notes.append(f"Traffic control: no separate line item — {explanation}")
+            else:
+                warnings.append("No traffic control items found")
+        if re.search(r"cleaning up|leave the site.{0,40}clean|debris", full_text, re.IGNORECASE):
+            info_notes.append("Site cleanup requirements are addressed in the tender specifications.")
+        if re.search(r"warranty|performance surety|bond", full_text, re.IGNORECASE):
+            info_notes.append("Warranty and/or surety obligations are addressed in the tender text.")
 
     elif project_type == "ROAD_RECONSTRUCTION":
-        if not any(kw in all_desc for kw in ["traffic", "sign"]):
-            warnings.append("No traffic control items found")
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment"]):
-            warnings.append("No erosion control items found")
-        if not any(kw in all_desc for kw in ["restoration", "topsoil", "seed"]):
-            warnings.append("No site restoration items found")
+        _add_warning_or_info(
+            "No traffic control items found",
+            ("traffic", "sign"),
+            ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+        )
+        _add_warning_or_info(
+            "No erosion control items found",
+            ("erosion", "silt", "sediment"),
+            ("erosion", "silt", "sediment"),
+        )
+        _add_warning_or_info(
+            "No site restoration items found",
+            ("restoration", "topsoil", "seed"),
+            ("restoration", "topsoil", "seed", "boulevard"),
+        )
 
     elif project_type == "LANDFILL":
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment"]):
-            warnings.append("No erosion control items found")
-        if not any(kw in all_desc for kw in ["leachate", "leachate pipe"]):
+        _add_warning_or_info(
+            "No erosion control items found",
+            ("erosion", "silt", "sediment"),
+            ("erosion", "silt", "sediment"),
+        )
+        if not _has_item_keywords("leachate", "leachate pipe"):
             warnings.append("No leachate management items found — verify scope")
-        if not any(kw in all_desc for kw in ["restoration", "topsoil", "seed"]):
-            warnings.append("No site restoration items found")
+        _add_warning_or_info(
+            "No site restoration items found",
+            ("restoration", "topsoil", "seed"),
+            ("restoration", "topsoil", "seed", "boulevard"),
+        )
 
     else:
         # DEFAULT / GENERAL_MUNICIPAL: original 4-warning set
-        if not any(kw in all_desc for kw in ["erosion", "silt", "sediment"]):
-            warnings.append("No erosion control items found")
-        if "dewater" not in all_desc:
-            warnings.append("No dewatering items found")
-        if not any(kw in all_desc for kw in ["traffic", "sign"]):
-            warnings.append("No traffic control items found")
-        if not any(kw in all_desc for kw in ["restoration", "topsoil", "seed"]):
-            warnings.append("No site restoration items found")
+        _add_warning_or_info(
+            "No erosion control items found",
+            ("erosion", "silt", "sediment"),
+            ("erosion", "silt", "sediment"),
+        )
+        _add_warning_or_info(
+            "No dewatering items found",
+            ("dewater",),
+            ("dewatering", "dewater"),
+        )
+        _add_warning_or_info(
+            "No traffic control items found",
+            ("traffic", "sign"),
+            ("traffic control", "traffic management", "signs", "barricades", "delineators"),
+        )
+        _add_warning_or_info(
+            "No site restoration items found",
+            ("restoration", "topsoil", "seed"),
+            ("restoration", "topsoil", "seed", "boulevard"),
+        )
 
-    return warnings
+    return warnings, info_notes
 
 
 def build_xlsx(
@@ -1991,13 +2438,16 @@ def build_xlsx(
     opss_refs: list,
     missing_warnings: list,
     val_warnings: list,
+    missing_info_notes: list | None = None,
     cost_risks: list | None = None,
     checklist_items: list | None = None,
     timeline_items: list | None = None,
     opss_notes_map: dict | None = None,
+    other_standards: list | None = None,
     possible_items: list | None = None,
     summary_rows: list | None = None,
     debug_info: dict | None = None,
+    project_type: str | None = None,
 ) -> BytesIO:
     """6-sheet workbook: Takeoff, Summary, OPSS Notes, Strategy & Risks, Bid Checklist, Timeline."""
     wb = openpyxl.Workbook()
@@ -2005,6 +2455,8 @@ def build_xlsx(
     checklist_items = checklist_items or []
     timeline_items  = timeline_items or []
     opss_notes_map  = opss_notes_map or OPSS_NOTES
+    missing_info_notes = missing_info_notes or []
+    other_standards = other_standards or []
     possible_items  = possible_items or []
     summary_rows    = summary_rows or []
 
@@ -2108,11 +2560,17 @@ def build_xlsx(
 
     # ── Sheet 3: OPSS Notes ──────────────────────────────────────────────────
     ws3 = wb.create_sheet("OPSS Notes")
-    _write_header(ws3, ["OPSS Code", "Description"], HEADER_FILL, HEADER_FONT)
+    notes_header = ["OPSS Code", "Description"] if opss_refs or not other_standards else ["Standards Reference", "Description"]
+    _write_header(ws3, notes_header, HEADER_FILL, HEADER_FONT)
     ws3.freeze_panes = "A2"
-    for r, code in enumerate(opss_refs, 2):
-        ws3.cell(r, 1, f"OPSS {code}")
-        ws3.cell(r, 2, opss_notes_map.get(code, "No description available"))
+    if opss_refs:
+        for r, code in enumerate(opss_refs, 2):
+            ws3.cell(r, 1, f"OPSS {code}")
+            ws3.cell(r, 2, opss_notes_map.get(code, "No description available"))
+    elif other_standards:
+        for r, std in enumerate(other_standards, 2):
+            ws3.cell(r, 1, std.get("code", ""))
+            ws3.cell(r, 2, std.get("description", ""))
     _autosize(ws3)
 
     # ── Sheet 4: Strategy & Risks ────────────────────────────────────────────
@@ -2154,21 +2612,35 @@ def build_xlsx(
 
     # Section B: Missing Scope Items
     row = _section(ws4, row, "B — MISSING SCOPE ITEMS")
-    row = _sub_header(ws4, row, ["Warning", "", "", "", ""])
+    row = _sub_header(ws4, row, ["Type", "Message", "", "", ""])
     for w in missing_warnings:
-        ws4.cell(row, 1, w); row += 1
-    if not missing_warnings:
+        ws4.cell(row, 1, "WARNING")
+        ws4.cell(row, 2, w)
+        row += 1
+    for note in missing_info_notes:
+        ws4.cell(row, 1, "INFO")
+        ws4.cell(row, 2, note)
+        row += 1
+    if not missing_warnings and not missing_info_notes:
         ws4.cell(row, 1, "All key item categories present"); row += 1
     row += 1
 
     # Section C: OPSS Compliance
-    row = _section(ws4, row, "C — OPSS COMPLIANCE REQUIREMENTS")
-    row = _sub_header(ws4, row, ["OPSS Code", "Description", "", "", ""])
-    for code in opss_refs:
-        ws4.cell(row, 1, f"OPSS {code}")
-        ws4.cell(row, 2, opss_notes_map.get(code, "No description available"))
-        row += 1
-    if not opss_refs:
+    section_c_title = "C — OPSS COMPLIANCE REQUIREMENTS" if opss_refs or not other_standards else "C — STANDARDS & COMPLIANCE REFERENCES"
+    row = _section(ws4, row, section_c_title)
+    c_header = ["OPSS Code", "Description", "", "", ""] if opss_refs or not other_standards else ["Standard", "Description", "", "", ""]
+    row = _sub_header(ws4, row, c_header)
+    if opss_refs:
+        for code in opss_refs:
+            ws4.cell(row, 1, f"OPSS {code}")
+            ws4.cell(row, 2, opss_notes_map.get(code, "No description available"))
+            row += 1
+    elif other_standards:
+        for std in other_standards:
+            ws4.cell(row, 1, std.get("code", ""))
+            ws4.cell(row, 2, std.get("description", ""))
+            row += 1
+    else:
         ws4.cell(row, 1, "No OPSS references detected"); row += 1
     row += 1
 
@@ -2211,6 +2683,9 @@ def build_xlsx(
         f"LUMP SUM ITEMS: {len(ls_items)} lump sum items — these are areas where contractors commonly underbid. Break each down before pricing.",
         f"HIGH RISK ITEMS: {sum(1 for r in cost_risks if r['severity']=='HIGH')} HIGH severity risks — require engineer clarification before bidding.",
     ]
+    if project_type == "MAINTENANCE":
+        tips.append("UNIT RATE STRATEGY: Estimated quantities and no guaranteed volume mean your unit rate must recover mobilization, insurance, and equipment costs even at reduced actual quantities.")
+        tips.append("SERVICE CONTRACT: Strong performance on the initial term can support renewals. Price sustainably and treat the first term as a relationship-building contract.")
     if qty_items:
         tips.append(f"LARGEST ITEMS BY QUANTITY (cross-check against drawings):")
     for item, qty in qty_items[:5]:
@@ -2551,6 +3026,7 @@ if extract_btn and uploaded:
         key=lambda x: int(x) if x.isdigit() else 9999,
     )
     opss_refs = all_opss_codes
+    other_standards = extract_other_standards_from_full_text(full_text) if not opss_refs else []
     # Build enriched note map: prefer full scan descriptions over hardcoded ones
     opss_note_map = {}
     for entry in opss_full_scan_results:
@@ -2570,8 +3046,13 @@ if extract_btn and uploaded:
     # Detect project type early so warnings are tailored to scope (not generic for all tenders)
     project_type = detect_project_type(full_text, items)
     print(f"[DEBUG PROJTYPE] detected project_type={project_type!r}", file=sys.stderr, flush=True)
-    missing_warnings = generate_missing_warnings(project_type, items)
-    print(f"[DEBUG PROJTYPE] generate_missing_warnings returned {len(missing_warnings)} warnings: {missing_warnings}", file=sys.stderr, flush=True)
+    missing_warnings, missing_info_notes = generate_missing_warnings(project_type, items, full_text=full_text)
+    print(
+        f"[DEBUG PROJTYPE] generate_missing_warnings returned {len(missing_warnings)} warnings and "
+        f"{len(missing_info_notes)} info notes: warnings={missing_warnings} info={missing_info_notes}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     # Step 8: Cross-verification
     with st.spinner("Running cross-verification..."):
@@ -2581,11 +3062,12 @@ if extract_btn and uploaded:
     tender_header = extract_tender_header(full_text)
 
     # Step 10: Bid submission checklist (Claude call on front matter)
-    front_matter = full_text[:FRONT_MATTER_CHARS]
-    checklist_items = call_claude_for_checklist(client, front_matter)
-    chars_used += len(front_matter)
+    checklist_source_text = build_checklist_source_text(full_text)
+    checklist_items = call_claude_for_checklist(client, checklist_source_text)
+    chars_used += len(checklist_source_text)
 
     # Step 11: Timeline extraction (Claude call on front matter)
+    front_matter = full_text[:FRONT_MATTER_CHARS]
     timeline_items = call_claude_for_timeline(client, front_matter)
     chars_used += len(front_matter)
 
@@ -2603,10 +3085,13 @@ if extract_btn and uploaded:
     with st.spinner("Building spreadsheet..."):
         xlsx_buffer = build_xlsx(
             items, opss_refs, missing_warnings, val_warnings,
-            cost_risks, checklist_items, timeline_items,
+            missing_info_notes=missing_info_notes,
+            cost_risks=cost_risks, checklist_items=checklist_items, timeline_items=timeline_items,
             opss_notes_map=opss_note_map,
+            other_standards=other_standards,
             possible_items=possible_items,
             summary_rows=summary_rows,
+            project_type=project_type,
             debug_info={
                 "code_version":  "59b219d",
                 "project_type":  project_type,
@@ -2642,8 +3127,10 @@ if extract_btn and uploaded:
         "xlsx_buffer":       xlsx_buffer,
         "val_warnings":      val_warnings,
         "missing_warnings":  missing_warnings,
+        "missing_info_notes": missing_info_notes,
         "opss_refs":         opss_refs,
         "opss_note_map":     opss_note_map,
+        "other_standards":   other_standards,
         "verify_results":    verify_results,
         "cost_risks":        cost_risks,
         "checklist_items":   checklist_items,
@@ -2911,13 +3398,18 @@ if items:
 
     # ── Sidebar: OPSS Intelligence ────────────────────────────────────────────
     _opss_note_map = st.session_state.get("opss_note_map", OPSS_NOTES)
+    _other_standards = st.session_state.get("other_standards", [])
     with opss_placeholder.container():
         if opss_refs:
             for code in opss_refs:
                 st.markdown(f"**OPSS {code}**")
                 st.caption(_opss_note_map.get(code, "No description available"))
+        elif _other_standards:
+            for std in _other_standards:
+                st.markdown(f"**{std.get('code', '')}**")
+                st.caption(std.get("description", ""))
         else:
-            st.caption("No matching OPSS specs found.")
+            st.caption("No matching OPSS or other standards references found.")
 
     # ── Sidebar: Cross-Verification ───────────────────────────────────────────
     with verify_placeholder.container():
@@ -2985,35 +3477,61 @@ elif not extract_btn:
 # Q&A Chat Interface
 # ─────────────────────────────────────────────
 def count_questions(text: str) -> int:
-    """Count questions by question marks + question-word sentences."""
-    import re
-    # Count explicit question marks
-    q_marks = text.count("?")
+    """Estimate distinct user questions conservatively for the quota warning."""
+    cleaned = re.sub(r'"[^"]*\?"', '"QUOTED"', text)
+    cleaned = re.sub(r"'[^']*\?'", "'QUOTED'", cleaned)
 
-    # Also detect question-word sentences without ? marks
-    sentences = re.split(r"[.!?\n]", text)
-    question_words = [
+    explicit_questions = re.findall(r"([^?]+\?)", cleaned, re.DOTALL)
+    follow_up_patterns = (
+        "what's the rule",
+        "what is the rule",
+        "what's the detail",
+        "what are the details",
+        "what's the process",
+        "what is the process",
+        "can you clarify",
+        "how so",
+        "why is that",
+    )
+
+    explicit_count = 0
+    for q in explicit_questions:
+        q_clean = " ".join(q.strip().lower().split())
+        if explicit_count > 0 and any(q_clean.startswith(pattern) for pattern in follow_up_patterns):
+            continue
+        explicit_count += 1
+
+    if explicit_count > 0:
+        return explicit_count
+
+    sentences = re.split(r"[.!?\n]", cleaned)
+    question_words = (
         "what", "how", "why", "when", "where",
         "is ", "are ", "can ", "does ", "did ",
         "will ", "would ", "should ", "could ",
-    ]
-    q_word_count = 0
-    for s in sentences:
-        s_stripped = s.strip().lower()
-        if any(s_stripped.startswith(qw) for qw in question_words) and len(s_stripped) > 15:
-            q_word_count += 1
-
-    # Take the higher of the two counts, minimum 1
-    return max(q_marks, q_word_count, 1)
+    )
+    q_word_count = sum(
+        1
+        for sentence in sentences
+        if (s := sentence.strip().lower()) and len(s) > 15 and any(s.startswith(qw) for qw in question_words)
+    )
+    return max(q_word_count, 1)
 
 
 def get_question_count_from_response(response_text: str, fallback_count: int) -> int:
-    """Parse Claude's own question count from its response."""
-    import re
+    """Parse the structured QUESTION_COUNT prefix from Sonnet's response."""
+    match = re.search(r"QUESTION_COUNT:\s*(\d+)", response_text)
+    if match:
+        return int(match.group(1))
     match = re.search(r"I see (\d+) questions? in your message", response_text)
     if match:
         return int(match.group(1))
     return fallback_count
+
+
+def clean_question_count_prefix(response_text: str) -> str:
+    """Remove the QUESTION_COUNT metadata line before displaying the answer."""
+    return re.sub(r"^\s*QUESTION_COUNT:\s*\d+\s*\n?", "", response_text, count=1, flags=re.MULTILINE).strip()
 
 
 if st.session_state.get("extraction_done"):
@@ -3076,10 +3594,19 @@ if st.session_state.get("extraction_done"):
         # Build OPSS notes text
         _opss = st.session_state.get("opss_refs", [])
         _opss_map = st.session_state.get("opss_note_map", OPSS_NOTES)
-        opss_notes_text = "\n".join(
-            f"- OPSS {code}: {_opss_map.get(code, 'See spec document')}"
-            for code in _opss
-        ) if _opss else "No OPSS specs detected."
+        _other_standards = st.session_state.get("other_standards", [])
+        if _opss:
+            opss_notes_text = "\n".join(
+                f"- OPSS {code}: {_opss_map.get(code, 'See spec document')}"
+                for code in _opss
+            )
+        elif _other_standards:
+            opss_notes_text = "\n".join(
+                f"- {std.get('code', '')}: {std.get('description', '')}"
+                for std in _other_standards
+            )
+        else:
+            opss_notes_text = "No OPSS specs or other standards detected."
 
         # Build strategy/risks text
         _risks = st.session_state.get("cost_risks", [])
@@ -3137,7 +3664,11 @@ if st.session_state.get("extraction_done"):
                                 "5. NEVER say 'check the tender documents' or 'this information isn't in the extracted data' if the answer exists ANYWHERE in the context provided. Search ALL sections before responding.\n"
                                 "6. When answering questions about contract mechanisms (measurement rules, payment terms, reclassification triggers), find and cite the EXACT contract language. Do not guess or give generic advice.\n"
                                 "7. For yes/no questions, give the YES or NO answer FIRST, then cite the contract provision that supports it.\n"
-                                "8. Calculate derived values when possible (e.g., working days between two dates, excluding weekends and holidays).\n\n"
+                                "8. Calculate derived values when possible (e.g., working days between two dates, excluding weekends and holidays).\n"
+                                "9. Before answering, count the number of DISTINCT questions being asked. Count topics, not raw question marks.\n"
+                                "10. A short follow-up like 'What's the rule?' or 'What are the details?' attached to the same topic is still one question.\n"
+                                "11. Ignore question marks inside quoted tender text.\n"
+                                "12. Start your response with exactly one line in this format: QUESTION_COUNT: [number]\n\n"
                                 f"COMPREHENSIVE TENDER DATA:\n{qa_context}\n\n"
                                 f"The system detected {num_questions} question(s) in this message. "
                                 f"The contractor is asking: {prompt}\n\n"
@@ -3150,9 +3681,10 @@ if st.session_state.get("extraction_done"):
                         }
                     ],
                 )
-                answer = response.content[0].text
-                claude_count = get_question_count_from_response(answer, num_questions)
+                raw_answer = response.content[0].text
+                claude_count = get_question_count_from_response(raw_answer, num_questions)
                 st.session_state.question_count += claude_count
+                answer = clean_question_count_prefix(raw_answer)
                 # Escape dollar signs so Streamlit doesn't render as LaTeX
                 display_answer = answer.replace("$", "\\$")
                 st.write(display_answer)
