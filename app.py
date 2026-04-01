@@ -3557,7 +3557,7 @@ if extract_btn and uploaded:
             summary_rows=summary_rows,
             project_type=project_type,
             debug_info={
-                "code_version":  "4dd3185+opss-guard-local",
+                "code_version":  "f2ea006",
                 "project_type":  project_type,
                 "opss_regex":    opss_regex_codes,
                 "opss_api":      opss_full_scan_codes,
