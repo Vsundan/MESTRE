@@ -725,8 +725,24 @@ def split_items_by_quality(items: list) -> tuple[list, list]:
     """
     main_items = []
     possible_items = []
+    confirmed_item_nos = {
+        _normalize_item_no(item.get("item_no"))
+        for item in items
+        if str(item.get("unit", "")).strip().lower() != "check manually"
+    }
+    confirmed_descs = {
+        re.sub(r"\s+", " ", str(item.get("description") or "").strip().lower())
+        for item in items
+        if str(item.get("unit", "")).strip().lower() != "check manually"
+    }
     for item in items:
-        if item.get("unit") == "Check manually":
+        if str(item.get("unit", "")).strip().lower() == "check manually":
+            item_no_key = _normalize_item_no(item.get("item_no"))
+            desc_key = re.sub(r"\s+", " ", str(item.get("description") or "").strip().lower())
+            if item_no_key and item_no_key in confirmed_item_nos:
+                continue
+            if desc_key and desc_key in confirmed_descs:
+                continue
             possible_items.append(item)
         else:
             main_items.append(item)
@@ -1417,12 +1433,153 @@ def _cluster_pages(detected: list, max_gap: int = 4) -> list[list]:
     return clusters
 
 
+def _page_has_high_conf_schedule_markers(text: str) -> bool:
+    lower = text.lower()
+    has_schedule_header = (
+        "schedule of items and prices" in lower
+        or "schedule of prices" in lower
+    )
+    has_quantity_col = bool(
+        re.search(r"(?:tender\s*quantity|est\.?\s*qty|(?:^|\s)qty(?:\s|$)|(?:^|\s)quantity(?:\s|$))", lower)
+    )
+    has_table_core = (
+        bool(re.search(r"item\s*no", lower))
+        and "description" in lower
+        and has_quantity_col
+        and "unit" in lower
+    )
+    has_pricing_cols = bool(re.search(r"unit\s*price", lower)) and "amount" in lower
+    has_part_total = bool(re.search(r"total\s+part\s+[a-f]", lower))
+    return bool(
+        (has_schedule_header and (has_table_core or has_pricing_cols or has_part_total))
+        or (has_table_core and has_pricing_cols)
+        or (has_part_total and has_table_core)
+    )
+
+
+def _expand_page_context(page_indices: list[int], total_pages: int, radius: int = 1) -> list[int]:
+    expanded = set()
+    for idx in page_indices:
+        start = max(0, idx - radius)
+        end = min(total_pages - 1, idx + radius)
+        expanded.update(range(start, end + 1))
+    return sorted(expanded)
+
+
+def _page_is_schedule_continuation(text: str) -> bool:
+    lower = text.lower()
+    marker_hits = sum(
+        1
+        for pattern in (
+            r"item\s*no",
+            r"description|(?:^|\s)item(?:\s|$)",
+            r"tender\s*quantity|(?:^|\s)quantity(?:\s|$)",
+            r"(?:^|\s)unit(?:\s|$)",
+            r"unit\s*price",
+            r"amount",
+        )
+        if re.search(pattern, lower)
+    )
+    has_rate_table = (
+        "description" in lower
+        and "hourly rate" in lower
+        and "subtotal" in lower
+        and "hours" in lower
+    )
+    return bool(
+        marker_hits >= 4
+        or has_rate_table
+        or re.search(r"\bpart\s+[a-f]\b", lower)
+        or "provisional" in lower
+        or "labour and equipment rates" in lower
+        or "schedule of additional unit prices" in lower
+    )
+
+
+def _page_has_rate_schedule_markers(text: str) -> bool:
+    lower = text.lower()
+    has_explicit_rate_header = (
+        "schedule of additional unit prices" in lower
+        or "schedule of force account rates" in lower
+    )
+    has_named_rate_section = (
+        "labour and equipment rates" in lower
+        and (
+            "additional labour requirements" in lower
+            or "additional equipment requirements" in lower
+            or "price/hr" in lower
+            or "price/day" in lower
+        )
+    )
+    has_rate_table = (
+        "description" in lower
+        and "hourly rate" in lower
+        and "subtotal" in lower
+        and "hours" in lower
+        and bool(re.search(r"(?:^|\n)\s*\d{1,2}[.)]\s", text))
+    )
+    return bool(
+        has_explicit_rate_header
+        or has_named_rate_section
+        or has_rate_table
+    )
+
+
+def _collect_adjacent_detected_pages(detected: list[int], pages_text: list[str], seed_pages: list[int]) -> list[int]:
+    detected_set = set(detected)
+    included = set()
+
+    def qualifies(idx: int) -> bool:
+        text = pages_text[idx]
+        return (
+            _page_has_high_conf_schedule_markers(text)
+            or _page_is_schedule_continuation(text)
+            or _page_has_rate_schedule_markers(text)
+        )
+
+    for seed in seed_pages:
+        if seed not in detected_set:
+            continue
+        included.add(seed)
+        prev = seed - 1
+        while prev in detected_set and qualifies(prev):
+            included.add(prev)
+            prev -= 1
+        nxt = seed + 1
+        while nxt in detected_set and qualifies(nxt):
+            included.add(nxt)
+            nxt += 1
+    return sorted(included)
+
+
+def _expected_multi_section_letters(schedule_text: str) -> set[str]:
+    return {match.group(1).upper() for match in re.finditer(r"\bpart\s+([A-F])\b", schedule_text, re.IGNORECASE)}
+
+
+def _extracted_multi_section_letters(items: list) -> set[str]:
+    letters = set()
+    for item in items:
+        raw = _normalize_item_no(item.get("item_no"))
+        match = re.fullmatch(r"\d+(?:\.\d+)?([A-F])", raw)
+        if match:
+            letters.add(match.group(1).upper())
+    return letters
+
+
 def build_schedule_text(pages_text: list, full_scan: bool) -> tuple[str, list]:
     if full_scan:
         return "\n\n".join(pages_text), list(range(len(pages_text)))
     detected = find_schedule_page_indices(pages_text)
     if not detected:
         return "\n\n".join(pages_text), list(range(len(pages_text)))
+    high_conf_pages = [idx for idx in detected if _page_has_high_conf_schedule_markers(pages_text[idx])]
+    if high_conf_pages:
+        rate_pages = [idx for idx in detected if _page_has_rate_schedule_markers(pages_text[idx])]
+        included = set(_expand_page_context(high_conf_pages, len(pages_text), radius=1))
+        included.update(_collect_adjacent_detected_pages(detected, pages_text, high_conf_pages + rate_pages))
+        included = sorted(included)
+        schedule_text = "\n\n".join(pages_text[i] for i in included)
+        return schedule_text, included
     # Use cluster-based ranges: only include pages within each tight cluster.
     # A gap of 5+ pages between detected pages = separate sections (likely spec pages in between).
     clusters = _cluster_pages(detected, max_gap=4)
@@ -1492,35 +1649,69 @@ def call_claude_with_retry(
         "Only include items with clear item numbers (numeric or alphanumeric like P1, LABOUR-1, E6, 1A, 11B). "
         "Return ONLY valid JSON — no markdown, no backticks, no explanation."
     )
-    base_prompt  = f"{instruction}\n\nSCHEDULE TEXT:\n{schedule_text}"
-    retry_prompt = (
-        "Your previous response was not valid JSON. "
-        "Return ONLY a JSON array, no markdown, no backticks, no explanation.\n\n"
-        f"SCHEDULE TEXT:\n{schedule_text}"
-    )
+    def _build_prompt(retry_note: str = "") -> str:
+        if retry_note:
+            return f"{instruction}\n\n{retry_note}\n\nSCHEDULE TEXT:\n{schedule_text}"
+        return f"{instruction}\n\nSCHEDULE TEXT:\n{schedule_text}"
+
+    retry_note = ""
     for attempt in range(1, 4):
         label = f"Extracting{' ' + chunk_label if chunk_label else ''} — attempt {attempt}/3..."
-        prompt = base_prompt if attempt == 1 else retry_prompt
+        prompt = _build_prompt(retry_note if attempt > 1 else "")
         with st.spinner(label):
             message = client.messages.create(
-                model=CLAUDE_MODEL, max_tokens=16000,
+                model=CLAUDE_MODEL, max_tokens=16000, temperature=0,
                 messages=[{"role": "user", "content": prompt}],
             )
         raw = message.content[0].text.strip()
         s, e = raw.find("["), raw.rfind("]") + 1
         if s != -1 and e > s:
             try:
-                return json.loads(raw[s:e])
+                parsed_items = json.loads(raw[s:e])
+                if not extra_instruction:
+                    expected_sections = _expected_multi_section_letters(schedule_text)
+                    if len(expected_sections) >= 3:
+                        extracted_sections = _extracted_multi_section_letters(parsed_items)
+                        missing_sections = sorted(expected_sections - extracted_sections)
+                        if missing_sections:
+                            if attempt == 3:
+                                st.warning(
+                                    "Extraction may be incomplete: tender contains "
+                                    f"Parts {', '.join(missing_sections)} but they were not found in the parsed output."
+                                )
+                            else:
+                                st.warning(
+                                    "Extraction may be incomplete: tender contains "
+                                    f"Parts {', '.join(missing_sections)} but they were not found in the parsed output. Retrying..."
+                                )
+                                retry_note = (
+                                    "Your previous response omitted one or more schedule sections. "
+                                    f"The schedule text includes Parts {', '.join(sorted(expected_sections))}. "
+                                    f"Your last output missed Parts {', '.join(missing_sections)}. "
+                                    "Re-read the FULL schedule and return a COMPLETE JSON array including ALL parts and suffixes. "
+                                    "Return ONLY valid JSON."
+                                )
+                                time.sleep(2)
+                                continue
+                return parsed_items
             except json.JSONDecodeError as err:
                 if attempt == 3:
                     st.error(f"All 3 attempts failed. Last error: {err}")
                     st.text(raw[:3000])
                     return []
+                retry_note = (
+                    "Your previous response was not valid JSON. "
+                    "Return ONLY one COMPLETE JSON array, no markdown, no backticks, no explanation."
+                )
         else:
             if attempt == 3:
                 st.error("All 3 attempts failed — no JSON array found.")
                 st.text(raw[:3000])
                 return []
+            retry_note = (
+                "Your previous response did not contain a JSON array. "
+                "Return ONLY one COMPLETE JSON array, no markdown, no backticks, no explanation."
+            )
         time.sleep(2)
     return []
 
@@ -1542,29 +1733,85 @@ def extract_in_chunks(client: anthropic.Anthropic, schedule_text: str) -> list:
     return all_items
 
 
+def _item_no_numeric_value(item_no: object) -> float | None:
+    raw = _normalize_item_no(item_no).rstrip(")")
+    if not raw:
+        return None
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z])?", raw)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _normalize_item_no_for_scan(value: object) -> str:
+    raw = _normalize_item_no(value).rstrip(")")
+    if not raw:
+        return ""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z])?", raw)
+    if not match:
+        return ""
+    number, suffix = match.groups()
+    numeric_value = _item_no_numeric_value(number)
+    if numeric_value is None or not (1 <= numeric_value <= 200):
+        return ""
+    if not suffix:
+        return number
+    if suffix.islower():
+        return f"{number}{suffix.lower()}"
+    if suffix.upper() in "ABCDEF":
+        return number
+    return ""
+
+
+def _page_has_recovery_schedule_signals(text: str) -> bool:
+    lower = text.lower()
+    marker_hits = sum(
+        1
+        for marker in (
+            "item no", "spec. no", "spec no", "description", "tender quantity",
+            "quantity", "unit", "unit price", "amount", "schedule of items and prices",
+            "schedule of prices", "provisional", "labour and equipment rates",
+            "schedule of additional unit prices",
+        )
+        if marker in lower
+    )
+    return marker_hits >= 3
+
+
+def _extract_candidate_item_nos_from_page(text: str) -> set[str]:
+    if not _page_has_recovery_schedule_signals(text):
+        return set()
+    pattern = re.compile(r"(?:^|\n)\s*(\d{1,3}(?:\.\d{1,2})?(?:\s*[a-z]\))?)\s+\S", re.MULTILINE)
+    found = set()
+    for match in pattern.finditer(text):
+        normalized = _normalize_item_no_for_scan(match.group(1))
+        if normalized:
+            found.add(normalized)
+    return found
+
+
 def second_pass_extraction(
     client: anthropic.Anthropic,
     pages_text: list,
     existing_items: list,
     schedule_page_indices: list,
 ) -> list:
-    extracted_item_nos = {str(i.get("item_no") or "").strip() for i in existing_items}
-    item_no_pattern = re.compile(r"(?:^|\n)\s*(\d{1,3}(?:\.\d{1,2})?(?:\s*[a-z]\))?)\s+\S", re.MULTILINE)
-    full_text_for_scan = "\n\n".join(pages_text)
-    all_found_nos = set()
-    for m in item_no_pattern.finditer(full_text_for_scan):
-        candidate = m.group(1).strip()
-        if re.match(r"^\d+\.\d+", candidate):
-            all_found_nos.add(candidate)
-    text_only_nos = all_found_nos - extracted_item_nos
-    if not text_only_nos:
-        return []
+    extracted_item_nos = {
+        normalized
+        for normalized in (_normalize_item_no_for_scan(i.get("item_no")) for i in existing_items)
+        if normalized
+    }
     covered = set(schedule_page_indices)
     suspected_pages = []
     for i, page in enumerate(pages_text):
         if i in covered:
             continue
-        if any(no in page for no in text_only_nos):
+        page_item_nos = _extract_candidate_item_nos_from_page(page)
+        text_only_nos = page_item_nos - extracted_item_nos
+        if text_only_nos:
             suspected_pages.append(i)
     if not suspected_pages:
         return []
@@ -1596,14 +1843,12 @@ def second_pass_extraction(
 
 def verify_extraction(items: list, full_text: str) -> list[dict]:
     results = []
-    main_items = [i for i in items if "." in str(i.get("item_no", ""))]
+    main_items = [i for i in items if _item_no_numeric_value(i.get("item_no")) is not None]
     item_nums = []
     for item in main_items:
-        raw = str(item.get("item_no", "")).split()[0].rstrip("abcdefghij)")
-        try:
-            item_nums.append(float(raw))
-        except ValueError:
-            pass
+        numeric_value = _item_no_numeric_value(item.get("item_no"))
+        if numeric_value is not None:
+            item_nums.append(numeric_value)
     item_nums = sorted(set(item_nums))
     gaps = []
     for i in range(len(item_nums) - 1):
