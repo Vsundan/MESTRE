@@ -3011,17 +3011,15 @@ def build_xlsx(
 
     # ── Sheet 3: OPSS Notes ──────────────────────────────────────────────────
     ws3 = wb.create_sheet("OPSS Notes")
-    notes_header = ["OPSS Code", "Description"] if opss_refs or not other_standards else ["Standards Reference", "Description"]
+    notes_header = ["OPSS Code", "Description"]
     _write_header(ws3, notes_header, HEADER_FILL, HEADER_FONT)
     ws3.freeze_panes = "A2"
     if opss_refs:
         for r, code in enumerate(opss_refs, 2):
             ws3.cell(r, 1, f"OPSS {code}")
             ws3.cell(r, 2, opss_notes_map.get(code, "No description available"))
-    elif other_standards:
-        for r, std in enumerate(other_standards, 2):
-            ws3.cell(r, 1, std.get("code", ""))
-            ws3.cell(r, 2, std.get("description", ""))
+    else:
+        ws3.cell(2, 1, "No OPSS specifications referenced in this tender.")
     _autosize(ws3)
 
     # ── Sheet 4: Strategy & Risks ────────────────────────────────────────────
@@ -3462,23 +3460,36 @@ if extract_btn and uploaded:
     summary_rows = extract_summary_rows(schedule_text)
     print(f"[DEBUG SUMMARY] matched {len(summary_rows)} summary rows: {[r.get('description','?') for r in summary_rows]}", file=sys.stderr, flush=True)
 
-    # Step 6: OPSS refs — Pass 1 (schedule items) + Pass 2 regex + Claude full scan (FIX 2+3)
+    # Step 6: OPSS refs — explicit matches gate any OPSS enrichment
     opss_refs_from_items = extract_opss_refs(items)
-    # FIX 2 Pass 2: zero-cost regex scan of full document
     print(f"[DEBUG OPSS] full_text length={len(full_text)} chars", file=sys.stderr, flush=True)
     opss_regex_codes = extract_opss_from_full_text(full_text)
     print(f"[DEBUG OPSS] regex pass found: {opss_regex_codes}", file=sys.stderr, flush=True)
-    opss_full_scan_results = call_claude_for_opss_full_scan(client, full_text)
-    chars_used += min(len(full_text), 80000)
-    # Merge all three passes: schedule items + regex + Claude full scan
-    opss_full_scan_codes = [str(e.get("code", "")).strip() for e in opss_full_scan_results if e.get("code")]
-    print(f"[DEBUG OPSS] claude pass found: {opss_full_scan_codes}", file=sys.stderr, flush=True)
     print(f"[DEBUG OPSS] pass1 (from items): {opss_refs_from_items}", file=sys.stderr, flush=True)
-    all_opss_codes = sorted(
-        set(opss_refs_from_items + opss_regex_codes + opss_full_scan_codes),
+    explicit_opss_codes = sorted(
+        set(opss_refs_from_items + opss_regex_codes),
         key=lambda x: int(x) if x.isdigit() else 9999,
     )
-    opss_refs = all_opss_codes
+
+    opss_full_scan_results = []
+    opss_full_scan_codes = []
+    if explicit_opss_codes:
+        opss_full_scan_results = call_claude_for_opss_full_scan(client, full_text)
+        chars_used += min(len(full_text), 80000)
+        opss_full_scan_codes = [str(e.get("code", "")).strip() for e in opss_full_scan_results if e.get("code")]
+        print(f"[DEBUG OPSS] claude pass found: {opss_full_scan_codes}", file=sys.stderr, flush=True)
+        opss_refs = sorted(
+            set(explicit_opss_codes + opss_full_scan_codes),
+            key=lambda x: int(x) if x.isdigit() else 9999,
+        )
+    else:
+        print(
+            "[DEBUG OPSS] hallucination guard active: no explicit OPSS refs in items/full text, skipping Claude/DB OPSS enrichment",
+            file=sys.stderr,
+            flush=True,
+        )
+        opss_refs = []
+
     other_standards = extract_other_standards_from_full_text(full_text) if not opss_refs else []
     # Build enriched note map: prefer full scan descriptions over hardcoded ones
     opss_note_map = {}
@@ -3490,7 +3501,7 @@ if extract_btn and uploaded:
                 desc = f"{desc} [{entry['date']}]"
             opss_note_map[code] = desc
     # Fill remaining codes with DB / hardcoded fallback
-    db_map = get_opss_notes_from_db([c for c in opss_refs if c not in opss_note_map])
+    db_map = get_opss_notes_from_db([c for c in opss_refs if c not in opss_note_map]) if opss_refs else {}
     for code in opss_refs:
         if code not in opss_note_map:
             opss_note_map[code] = db_map.get(code, OPSS_NOTES.get(code, f"OPSS {code} — see spec document"))
@@ -3546,7 +3557,7 @@ if extract_btn and uploaded:
             summary_rows=summary_rows,
             project_type=project_type,
             debug_info={
-                "code_version":  "512ee00",
+                "code_version":  "4dd3185+opss-guard-local",
                 "project_type":  project_type,
                 "opss_regex":    opss_regex_codes,
                 "opss_api":      opss_full_scan_codes,
